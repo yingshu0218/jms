@@ -1,0 +1,37 @@
+name: 功能建议
+description: 建议一个新功能或改进
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: 你想解决什么问题
+      description: 描述场景，而不是直接给方案 —— 这样更容易找到更合适的做法
+      placeholder: |
+        我经常需要在「只有某个应用走代理」和「全部走代理」之间切换，
+        每次都要进设置改，希望能更快。
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 你设想的做法（可选）
+    validations:
+      required: false
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: 涉及范围
+      options:
+        - 界面 / 交互
+        - 路由与分流规则
+        - 系统代理
+        - 进程级 TUN
+        - 订阅管理
+        - 桌面外壳（托盘 / 自启 / 更新）
+        - 打包与发布
+        - 其他
+    validations:
+      required: true

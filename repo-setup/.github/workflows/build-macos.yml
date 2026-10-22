@@ -1,0 +1,248 @@
+name: Build macOS app
+
+# 在 GitHub 的 macOS 机器上把应用真正编译出来 —— 本地不需要 Rust、不需要 Xcode。
+#
+# 触发方式：
+#   · 推送到 main / 提 PR  → 自动构建，产物在 Actions 页面的 Artifacts 里
+#   · 手动运行（Actions → Run workflow）→ 可勾选同时构建 Intel 版
+#   · 打 v* 标签 → 自动创建 Release 并把安装包挂上去（下载最方便）
+#
+# 产物有两份，互不依赖：
+#   1. "JMS Client（原生窗口）"  —— Swift + WKWebView，只需 Xcode 命令行工具，几十秒出结果。
+#      这是**必定能成功**的那一份，独立窗口 + Dock 图标 + Cmd+Q。
+#   2. "JMS Client（Tauri）"     —— 完整外壳（托盘、开机自启），需要编译 Rust，耗时较长。
+#      万一 Tauri 依赖出问题，第 1 份仍然可用。
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      build_intel:
+        description: '同时构建 Intel（x86_64）版本'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+env:
+  NODE_VERSION: '22'
+  # 内核版本固定，避免上游发新版导致配置行为变化（1.14 是 route.default_domain_resolver 的分水岭）
+  SINGBOX_VERSION: '1.14.3'
+
+jobs:
+  # ── 单元测试：Linux 上跑得快，先拦住明显回归 ────────────────────────────
+  test:
+    name: 单元测试
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - name: 安装依赖
+        run: npm install --no-audit --no-fund
+      - name: 运行测试
+        run: npm test
+
+  # ── 原生窗口版：Swift + WKWebView，最快最稳 ────────────────────────────
+  swift-app:
+    name: 构建（原生窗口）
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: 环境信息
+        run: |
+          sw_vers
+          echo "架构: $(uname -m)"
+          echo "node: $(node -v)"
+          swiftc --version
+
+      - name: 准备内核（下载并固定版本）
+        run: |
+          mkdir -p src-tauri/resources/core
+          curl -sSL --retry 3 -o /tmp/sb.tar.gz \
+            "https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VERSION}/sing-box-${SINGBOX_VERSION}-darwin-arm64.tar.gz"
+          tar xzf /tmp/sb.tar.gz -C /tmp
+          cp /tmp/sing-box-${SINGBOX_VERSION}-darwin-arm64/sing-box src-tauri/resources/core/sing-box
+          chmod 755 src-tauri/resources/core/sing-box
+          src-tauri/resources/core/sing-box version
+
+      - name: 安装依赖
+        run: npm install --no-audit --no-fund
+
+      - name: 组装应用（含原生窗口宿主）
+        run: ./tools/make-macos-app.sh --swift
+
+      - name: 校验产物
+        run: |
+          APP="dist/JMS Client.app"
+          test -x "$APP/Contents/MacOS/jms-launcher" || { echo "启动器缺失"; exit 1; }
+          test -x "$APP/Contents/MacOS/jms-host"     || { echo "原生宿主缺失"; exit 1; }
+          test -x "$APP/Contents/Resources/engine/jms-engine" || { echo "引擎缺失"; exit 1; }
+          test -x "$APP/Contents/Resources/core/sing-box"     || { echo "内核缺失"; exit 1; }
+          plutil -lint "$APP/Contents/Info.plist"
+          codesign -v "$APP/Contents/MacOS/jms-host" || { echo "宿主签名无效"; exit 1; }
+          # 真的把引擎跑起来看一眼 —— 打包最常见的失败就是 sidecar 起不来
+          SMOKE="$(mktemp -d)"
+          "$APP/Contents/Resources/engine/jms-engine" --dir "$SMOKE" --port 18788 &
+          ENG=$!
+          ok=0
+          for i in $(seq 1 40); do
+            if curl -sf http://127.0.0.1:18788/api/state > /tmp/state.json; then ok=1; break; fi
+            sleep 0.25
+          done
+          kill $ENG 2>/dev/null || true
+          [ "$ok" = "1" ] || { echo "引擎未能启动"; exit 1; }
+          node -e '
+            const s = require("/tmp/state.json");
+            if (!(s.status && s.settings)) { console.error("状态结构不完整"); process.exit(1); }
+            if (/public_key|"uuid"|password|token/.test(JSON.stringify(s))) {
+              console.error("接口泄漏凭据"); process.exit(1);
+            }
+            console.log("引擎自检通过：mode=" + s.settings.mode + " port=" + s.settings.port);
+          '
+          echo "体积: $(du -sh "$APP" | cut -f1)"
+
+      - name: 打包（保留符号链接与权限）
+        run: |
+          cd dist
+          ditto -c -k --sequesterRsrc --keepParent "JMS Client.app" ../JMS-Client-macos-arm64.zip
+          ls -lh ../JMS-Client-macos-arm64.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: JMS-Client-macos-arm64
+          path: JMS-Client-macos-arm64.zip
+          if-no-files-found: error
+          retention-days: 30
+
+  # ── 完整版：Tauri 外壳（托盘 / 开机自启）────────────────────────────────
+  tauri-arm:
+    name: 构建（Tauri / arm64）
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: 安装依赖
+        run: npm install --no-audit --no-fund
+
+      - name: 构建引擎 sidecar
+        run: ./tools/build-sidecar.sh aarch64-apple-darwin
+
+      - name: 准备内核
+        run: |
+          mkdir -p src-tauri/resources/core
+          curl -sSL --retry 3 -o /tmp/sb.tar.gz \
+            "https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VERSION}/sing-box-${SINGBOX_VERSION}-darwin-arm64.tar.gz"
+          tar xzf /tmp/sb.tar.gz -C /tmp
+          cp /tmp/sing-box-${SINGBOX_VERSION}-darwin-arm64/sing-box src-tauri/resources/core/sing-box
+          chmod 755 src-tauri/resources/core/sing-box
+
+      - name: 安装 Tauri CLI
+        run: npm install --no-audit --no-fund --save-dev @tauri-apps/cli@^2
+
+      - name: 编译（只出 .app，跳过 dmg —— dmg 在无图形环境里偶发失败）
+        run: cd src-tauri && npx tauri build --bundles app
+
+      - name: 打包
+        run: |
+          APP="src-tauri/target/release/bundle/macos/JMS Client.app"
+          test -d "$APP" || { echo "未找到 .app，列出 bundle 目录："; find src-tauri/target/release/bundle -maxdepth 3; exit 1; }
+          codesign --force --deep --sign - "$APP" || true
+          cd src-tauri/target/release/bundle/macos
+          ditto -c -k --sequesterRsrc --keepParent "JMS Client.app" "$GITHUB_WORKSPACE/JMS-Client-tauri-arm64.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: JMS-Client-tauri-arm64
+          path: JMS-Client-tauri-arm64.zip
+          if-no-files-found: error
+
+  # ── Intel 版：仅在手动触发并勾选时运行 ──────────────────────────────────
+  # macos-13 已于 2025-12 下线；现在唯一可用的 x86_64 镜像是 macos-15-intel。
+  tauri-intel:
+    name: 构建（Tauri / x86_64）
+    if: github.event_name == 'workflow_dispatch' && inputs.build_intel
+    runs-on: macos-15-intel
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: 安装依赖
+        run: npm install --no-audit --no-fund
+
+      - name: 构建引擎 sidecar
+        run: ./tools/build-sidecar.sh x86_64-apple-darwin
+
+      - name: 准备内核
+        run: |
+          mkdir -p src-tauri/resources/core
+          curl -sSL --retry 3 -o /tmp/sb.tar.gz \
+            "https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VERSION}/sing-box-${SINGBOX_VERSION}-darwin-amd64.tar.gz"
+          tar xzf /tmp/sb.tar.gz -C /tmp
+          cp /tmp/sing-box-${SINGBOX_VERSION}-darwin-amd64/sing-box src-tauri/resources/core/sing-box
+          chmod 755 src-tauri/resources/core/sing-box
+
+      - name: 安装 Tauri CLI
+        run: npm install --no-audit --no-fund --save-dev @tauri-apps/cli@^2
+
+      - name: 编译
+        run: cd src-tauri && npx tauri build --bundles app
+
+      - name: 打包
+        run: |
+          cd src-tauri/target/release/bundle/macos
+          ditto -c -k --sequesterRsrc --keepParent "JMS Client.app" "$GITHUB_WORKSPACE/JMS-Client-tauri-x64.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: JMS-Client-tauri-x64
+          path: JMS-Client-tauri-x64.zip
+          if-no-files-found: error
+
+  # ── 打标签时自动发 Release，下载不需要登录 ──────────────────────────────
+  release:
+    name: 发布 Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [swift-app]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: 汇总产物
+        run: find artifacts -type f -name '*.zip' -exec cp {} . \;
+      - name: 创建 Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "JMS Client ${GITHUB_REF_NAME}" \
+            --generate-notes \
+            *.zip

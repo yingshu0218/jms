@@ -1,0 +1,11 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "主窗口的最小权限集。引擎进程由 Rust 侧直接拉起，不需要给前端任何进程执行能力 —— 页面只能发本机 HTTP 请求，够用了。",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "core:window:allow-start-dragging",
+    "autostart:default"
+  ]
+}

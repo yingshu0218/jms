@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 安全 / 凭据相关问题
+    url: https://github.com/OWNER/REPO/security/advisories/new
+    about: 涉及凭据泄漏、权限提升等问题请走私密报告，不要开公开 issue
+  - name: 使用问题（非缺陷）
+    url: https://github.com/OWNER/REPO/discussions
+    about: 配置怎么调、某个站点为什么不通之类的问题，适合在讨论区问

@@ -1,0 +1,32 @@
+# 统一换行符与文本处理：让 diff 不受操作系统影响
+* text=auto eol=lf
+
+# 明确按文本处理（否则在 Windows 上检出可能被转成 CRLF，diff 全是噪音）
+*.mjs   text eol=lf
+*.js    text eol=lf
+*.json  text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.md    text eol=lf
+*.html  text eol=lf
+*.css   text eol=lf
+*.rs    text eol=lf
+*.toml  text eol=lf
+
+# shell 脚本一律 LF：CRLF 的 shebang 会让 macOS / Linux 直接报
+# "bad interpreter: /usr/bin/env: no such file or directory"
+*.sh    text eol=lf
+
+# Swift 里 LF 也够；但保留给未来可能的编辑器
+*.swift text eol=lf
+
+# 二进制：绝不做换行符转换，也不要在 diff 里显示
+*.png   binary
+*.ico   binary
+*.icns  binary
+*.zip   binary
+*.gz    binary
+*.dmg   binary
+
+# 语言统计时把生成/锁文件排除，否则它们会淹掉真实代码量
+package-lock.json  linguist-generated=true -diff

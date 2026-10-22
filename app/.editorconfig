@@ -1,0 +1,35 @@
+# 编辑器统一配置
+# 目的是让不同人的编辑器产出的文件在 git 里看不出差别。
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 2
+
+[*.md]
+# Markdown 里行尾两个空格是「显式换行」，不能删
+trim_trailing_whitespace = false
+
+[*.rs]
+indent_size = 4
+
+[*.swift]
+indent_size = 4
+
+[*.{yml,yaml}]
+indent_size = 2
+
+[{Makefile,makefile}]
+indent_style = tab
+
+[*.sh]
+# shell 没有强制缩进规范，跟仓库保持一致即可
+indent_size = 2
+
+[*.{png,ico,icns,zip,gz}]
+insert_final_newline = false
+trim_trailing_whitespace = false

@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleName</key>
+	<string>JMS Client</string>
+	<key>CFBundleDisplayName</key>
+	<string>JMS Client</string>
+	<!-- 固定指向 shell 启动器；由它判断该走哪条路：
+	     存在 Contents/MacOS/jms-host（swift 模式编译出的原生窗口宿主）就用它，
+	     否则自己拉起引擎并用浏览器打开界面。
+	     好处是无论哪种情况双击都有反应。 -->
+	<key>CFBundleExecutable</key>
+	<string>jms-launcher</string>
+	<key>CFBundleIdentifier</key>
+	<string>app.jms.client</string>
+	<key>CFBundleVersion</key>
+	<string>0.2.0</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.2.0</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>LSMinimumSystemVersion</key>
+	<string>11.0</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.utilities</string>
+	<!-- 界面由本地引擎通过 http://127.0.0.1:7788 提供。
+	     ATS 默认禁止明文 HTTP，不加这一段 WKWebView 会加载失败（白屏）。 -->
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+		<key>NSExceptionDomains</key>
+		<dict>
+			<key>127.0.0.1</key>
+			<dict>
+				<key>NSExceptionAllowsInsecureHTTPLoads</key>
+				<true/>
+				<key>NSIncludesSubdomains</key>
+				<false/>
+			</dict>
+			<key>localhost</key>
+			<dict>
+				<key>NSExceptionAllowsInsecureHTTPLoads</key>
+				<true/>
+			</dict>
+		</dict>
+	</dict>
+</dict>
+</plist>

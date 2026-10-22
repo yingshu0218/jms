@@ -1,0 +1,988 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>JMS // 控制台</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root{
+    /* 阻焊绿 + 沉金走线 —— 取材自电路板与测试仪器，刻意避开通用的"近黑+荧光绿" */
+    --mask:#091710; --mask-2:#0D2117; --panel:#102A1C; --panel-hi:#163523;
+    --gold:#C9A227; --gold-dim:#7C6A1E; --gold-hi:#E8C55C;
+    --sig:#4FE39A; --sig-dim:#1E6B48;
+    --amber:#E0912F; --danger:#E05B4A;
+    --ink:#F0F7F2; --ink-2:#BFD6C8; --ink-3:#A0BFAE;
+    --line:#20422E; --line-hi:#33604A;
+    --mono:ui-monospace,"SFMono-Regular","JetBrains Mono",Menlo,Consolas,monospace;
+    --sans:"Chakra Petch",system-ui,-apple-system,"Segoe UI","Noto Sans SC","PingFang SC","Microsoft YaHei",sans-serif;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{
+    margin:0;background:var(--mask);color:var(--ink);
+    font-family:var(--sans);font-size:14px;line-height:1.5;
+    -webkit-font-smoothing:antialiased;
+    background-image:radial-gradient(1200px 600px at 78% -10%,rgba(79,227,154,.055),transparent 60%);
+  }
+  .mono{font-family:var(--mono)}
+  .lbl{font-family:var(--mono);font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:var(--ink-3)}
+  button{font:inherit;color:inherit;background:none;border:none;cursor:pointer}
+  :focus-visible{outline:2px solid var(--sig);outline-offset:2px;border-radius:2px}
+  input{font:inherit}
+  .field input{line-height:1.45;padding:9px 10px}
+
+  /* ── 骨架 ── */
+  .shell{min-height:100%;display:flex;flex-direction:column}
+  header.top{
+    display:flex;align-items:center;gap:18px;padding:12px 20px;
+    border-bottom:1px solid var(--line);background:linear-gradient(180deg,#0C2418,#091710);
+    position:sticky;top:0;z-index:20;
+  }
+  .mark{display:flex;align-items:baseline;gap:9px;letter-spacing:.04em}
+  .mark b{font-weight:700;font-size:15px}
+  .mark span{font-family:var(--mono);font-size:10px;color:var(--gold);letter-spacing:.2em}
+  .top-right{margin-left:auto;display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+  .pill{
+    display:inline-flex;align-items:center;gap:7px;padding:5px 11px;border:1px solid var(--line-hi);
+    border-radius:999px;font-family:var(--mono);font-size:11px;letter-spacing:.06em;background:var(--mask-2);
+  }
+  .dot{width:7px;height:7px;border-radius:50%;background:var(--ink-3);flex:none}
+  .dot.on{background:var(--sig);box-shadow:0 0 0 3px rgba(79,227,154,.16)}
+  .dot.warn{background:var(--amber)}
+  .dot.busy{background:var(--gold);animation:blink 1s steps(2,end) infinite}
+  @keyframes blink{50%{opacity:.25}}
+
+  .body{display:grid;grid-template-columns:336px minmax(0,1fr);flex:1;min-height:0}
+
+  /* ── 左侧导轨 ── */
+  .rail{border-right:1px solid var(--line);background:var(--mask-2);padding:13px;display:flex;flex-direction:column;gap:10px;overflow:auto}
+  .card{border:1px solid var(--line);background:var(--panel);border-radius:3px}
+  .card > h2{
+    margin:0;padding:9px 12px;border-bottom:1px solid var(--line);
+    font-family:var(--mono);font-size:10px;letter-spacing:.16em;text-transform:uppercase;
+    color:var(--ink-2);display:flex;align-items:center;gap:8px;font-weight:500;
+  }
+  .card > h2 .nn{margin-left:auto;color:var(--ink-3);letter-spacing:.06em}
+  .card .pad{padding:10px}
+
+  /* 主控制 —— 唯一允许"重"的按钮 */
+  .primary{
+    width:100%;padding:17px 16px;border-radius:3px;border:1px solid var(--line-hi);
+    background:linear-gradient(180deg,#17402A,#10291C);
+    display:flex;align-items:center;gap:14px;text-align:left;transition:border-color .15s,transform .06s;
+  }
+  .primary:hover{border-color:var(--sig-dim)}
+  .primary:active{transform:translateY(1px)}
+  .primary[disabled]{opacity:.5;cursor:not-allowed}
+  .primary .big{font-size:19px;font-weight:600;letter-spacing:.02em}
+  .primary .sub{font-family:var(--mono);font-size:10.5px;color:var(--ink-2);letter-spacing:.06em;margin-top:3px}
+  .primary .glyph{
+    width:30px;height:30px;flex:none;border:1px solid var(--sig-dim);border-radius:2px;
+    display:grid;place-items:center;color:var(--sig);font-family:var(--mono);font-size:14px;
+  }
+  .primary.off .glyph{color:var(--gold);border-color:var(--gold-dim)}
+
+  .kv{display:grid;grid-template-columns:auto 1fr;gap:7px 12px;font-family:var(--mono);font-size:11.5px}
+  .kv dt{color:var(--ink-3);letter-spacing:.05em}
+  .kv dd{margin:0;text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+  .seg{display:flex;border:1px solid var(--line-hi);border-radius:3px;overflow:hidden}
+  .seg button{flex:1;padding:9px 6px;font-family:var(--mono);font-size:10.5px;letter-spacing:.08em;color:var(--ink-2);background:var(--mask-2)}
+  .seg button[aria-pressed="true"]{background:var(--panel-hi);color:var(--ink);box-shadow:inset 0 -2px 0 var(--gold)}
+  .seg button + button{border-left:1px solid var(--line-hi)}
+
+  .apps{display:flex;flex-wrap:wrap;gap:6px;margin-top:9px}
+  .app{
+    font-family:var(--mono);font-size:10.5px;padding:4px 8px;border:1px dashed var(--line-hi);
+    border-radius:2px;color:var(--ink-2);letter-spacing:.04em;
+  }
+  .field{display:flex;gap:8px;margin-top:4px}
+  .field input{
+    flex:1;min-width:0;background:var(--mask);border:1px solid var(--line-hi);color:var(--ink);
+    font-family:var(--mono);font-size:11.5px;padding:8px 9px;border-radius:2px;
+  }
+  .field input::placeholder{color:var(--ink-3)}
+  .btn{
+    padding:8px 12px;border:1px solid var(--line-hi);border-radius:2px;background:var(--panel-hi);
+    font-family:var(--mono);font-size:10.5px;letter-spacing:.08em;white-space:nowrap;
+  }
+  .btn:hover{border-color:var(--gold-dim);color:var(--gold-hi)}
+  .btn.sm{padding:6px 9px;font-size:10px}
+  .btn[disabled]{opacity:.45;cursor:not-allowed}
+
+  /* ── 主区 ── */
+  main{padding:18px;display:flex;flex-direction:column;gap:16px;min-width:0;overflow:auto}
+  .route{position:relative;padding:16px 18px 12px}
+  .stage{font-family:var(--mono);font-size:9.5px;letter-spacing:.18em;text-transform:uppercase;color:var(--ink-3)}
+  svg{display:block;width:100%;height:auto;overflow:visible}
+  .trace{fill:none;stroke:var(--gold-dim);stroke-width:1.5}
+  .trace.live{stroke:var(--sig);stroke-width:2}
+  .trace.lane-dead{stroke:var(--line)}
+  .lane-tag{font-family:var(--mono);font-size:10px;letter-spacing:.1em}
+  .flow{stroke-dasharray:5 9;animation:flow 1.15s linear infinite}
+  @keyframes flow{to{stroke-dashoffset:-28}}
+  .via{fill:var(--mask);stroke:var(--gold);stroke-width:1.5}
+
+  .cols{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:16px;align-items:start}
+  table{width:100%;border-collapse:collapse;font-family:var(--mono);font-size:11.5px}
+  th{
+    text-align:left;padding:7px 8px;border-bottom:1px solid var(--line);color:var(--ink-3);
+    font-weight:400;font-size:9.5px;letter-spacing:.14em;text-transform:uppercase;
+  }
+  td{padding:8px;border-bottom:1px solid var(--line);vertical-align:middle}
+  tr.node{cursor:pointer}
+  tr.node:hover td{background:var(--panel-hi)}
+  tr.node[aria-selected="true"] td{background:#14331F;box-shadow:inset 2px 0 0 var(--sig)}
+  .nm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:230px}
+  .rtt{text-align:right;font-variant-numeric:tabular-nums;color:var(--sig)}
+  .rtt.bad{color:var(--amber)}
+  .rtt.na{color:var(--ink-3)}
+  .tag{font-size:9.5px;letter-spacing:.06em;padding:2px 5px;border:1px solid var(--line-hi);border-radius:2px;color:var(--ink-2)}
+
+  .log{
+    font-family:var(--mono);font-size:10.5px;line-height:1.65;height:240px;overflow:auto;
+    padding:10px 12px;background:#08130E;color:var(--ink-2);white-space:pre-wrap;word-break:break-all;
+  }
+  .log:empty::before{content:"等待内核日志…";color:var(--ink-2)}
+  .log .l-warn{color:var(--amber)}
+  .log .l-err{color:var(--danger)}
+  .log .l-sys{color:var(--gold)}
+  .empty{padding:22px 12px;text-align:center;color:var(--ink-3);font-family:var(--mono);font-size:11px}
+  .notice{
+    font-family:var(--mono);font-size:11px;padding:9px 12px;border-radius:2px;
+    border:1px solid var(--gold-dim);background:rgba(224,145,47,.09);color:var(--gold-hi);
+  }
+  .badge-demo{
+    font-family:var(--mono);font-size:10px;letter-spacing:.1em;padding:4px 8px;border-radius:2px;
+    border:1px solid var(--gold-dim);color:var(--gold-hi);background:rgba(201,162,39,.12);
+  }
+
+  /* ── 常用链接检测 ── */
+  .links{display:grid;grid-template-columns:repeat(auto-fill,minmax(152px,1fr));gap:8px;margin-top:12px}
+  .lk{border:1px solid var(--line-hi);border-radius:3px;padding:9px 10px;background:var(--mask-2);transition:border-color .15s}
+  .lk .n{font-size:12px;display:flex;align-items:center;gap:7px}
+  .lk .n .d{width:7px;height:7px;border-radius:50%;flex:none;background:var(--ink-3)}
+  .lk .m{font-family:var(--mono);font-size:10.5px;color:var(--ink-2);margin-top:5px}
+  .lk .g{font-family:var(--mono);font-size:9px;letter-spacing:.08em;color:var(--ink-3);margin-top:4px}
+  .lk.ok{border-color:var(--sig-dim)}
+  .lk.ok .d{background:var(--sig);box-shadow:0 0 0 3px rgba(79,227,154,.14)}
+  .lk.ok .m{color:var(--sig)}
+  .lk.bad{border-color:#5A2A22}
+  .lk.bad .d{background:var(--danger)}
+  .lk.bad .m{color:#F0A196}
+  .lk.pending .d{background:var(--gold);animation:blink 1s steps(2,end) infinite}
+  .lk-verdict{margin-top:11px;font-family:var(--mono);font-size:11px;padding:9px 11px;border-radius:2px;line-height:1.7}
+  .lk-verdict.ok{border:1px solid var(--sig-dim);background:rgba(79,227,154,.08);color:var(--sig)}
+  .lk-verdict.warn{border:1px solid var(--gold-dim);background:rgba(201,162,39,.1);color:var(--gold-hi)}
+  .lk-verdict.bad{border:1px solid #5A2A22;background:rgba(224,91,74,.1);color:#F0A196}
+  .lk-verdict .diag{display:block;margin-top:5px;color:var(--ink-2)}
+  .chk{display:flex;align-items:center;gap:6px;cursor:pointer;user-select:none}
+  .chk input{accent-color:var(--gold);cursor:pointer}
+
+  /* ── 分流规则编辑器 ── */
+  .rules{display:flex;flex-direction:column;gap:5px;margin-top:9px;max-height:264px;overflow:auto}
+  .rule{display:flex;align-items:center;gap:7px;font-family:var(--mono);font-size:10.5px;
+    padding:5px 7px;border:1px solid var(--line);border-radius:2px;background:var(--mask-2)}
+  .rule .rv{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--ink)}
+  .rule .ro{font-size:9px;padding:1px 5px;border-radius:2px;border:1px solid var(--line-hi);color:var(--ink-3);flex:none}
+  .rule .ro.p{color:var(--sig);border-color:var(--sig-dim)}
+  .rule .ro.d{color:var(--gold-hi);border-color:var(--gold-dim)}
+  .rule .del{color:var(--ink-3);padding:0 3px;font-size:11px;line-height:1}
+  .rule .del:hover{color:var(--danger)}
+  .rule-add{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-top:9px}
+  .rule-add select,.rule-add input,#rules-import-mode{background:var(--mask);border:1px solid var(--line-hi);color:var(--ink);
+    font-family:var(--mono);font-size:10.5px;padding:6px 7px;border-radius:2px;min-width:0;width:100%}
+  .rule-add #rule-value,.rule-add #rules-add{grid-column:1/3}
+  @media (max-width:1020px){
+    .body{grid-template-columns:1fr}
+    .rail{border-right:none;border-bottom:1px solid var(--line)}
+    .cols{grid-template-columns:1fr}
+  }
+  @media (prefers-reduced-motion:reduce){
+    .flow{animation:none}
+    .dot.busy{animation:none}
+  }
+/* ui-polish-2 */
+/* ui-desktop-3 */
+/* ui-privilege-4 */
+</style>
+</head>
+<body>
+<div class="shell">
+  <header class="top">
+    <div class="mark"><b>JMS</b><span>// 控制台</span></div>
+    <div class="top-right">
+      <span class="pill" id="p-status"><i class="dot" id="d-status"></i><span id="t-status">未连接</span></span>
+      <span class="pill" id="p-node"><span class="lbl">节点</span> <span id="t-node" class="mono">—</span></span>
+      <span class="pill"><span class="lbl">运行</span> <span id="t-uptime" class="mono">—</span></span>
+      <span class="badge-demo" id="demo-badge" hidden>演示数据</span>
+    </div>
+  </header>
+
+  <div class="body">
+    <!-- ── 导轨 ── -->
+    <aside class="rail">
+      <button class="primary off" id="btn-toggle">
+        <span class="glyph" id="glyph">▶</span>
+        <span>
+          <span class="big" id="btn-label">连接</span>
+          <span class="sub" id="btn-sub">系统代理 · 端口 2080</span>
+        </span>
+      </button>
+
+      <div class="card">
+        <h2>接管方式</h2>
+        <div class="pad">
+          <div class="seg" role="group" aria-label="接管方式">
+            <button id="mode-sysproxy" aria-pressed="true">系统代理</button>
+            <button id="mode-tun-per-app" aria-pressed="false">进程级 TUN</button>
+          </div>
+          <p class="lbl" style="margin:13px 0 6px">路由模式</p>
+          <div class="seg" role="group" aria-label="路由模式">
+            <button id="rm-rule" aria-pressed="true">规则</button>
+            <button id="rm-global" aria-pressed="false">全局</button>
+            <button id="rm-direct" aria-pressed="false">直连</button>
+          </div>
+          <p class="lbl" id="routing-hint" style="margin:9px 0 0;line-height:1.7"></p>
+          <p class="lbl" id="mode-hint" style="margin:9px 0 0;line-height:1.7">
+            零提权，遵守系统代理的应用生效。
+          </p>
+          <div id="apps-wrap" hidden>
+            <label class="chk lbl" style="margin-top:11px"><input type="checkbox" id="reverse-apps"> 反向应用名单</label>
+            <p class="lbl" id="apps-hint" style="margin:8px 0">名单内应用按规则分流，名单外直连</p>
+            <div class="apps" id="apps"></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>订阅 <span class="nn" id="sub-updated">—</span></h2>
+        <div class="pad">
+          <div class="field">
+            <input id="sub-url" type="password" placeholder="订阅链接（仅存本机）" autocomplete="off" spellcheck="false">
+            <button class="btn" id="btn-save">保存</button>
+          </div>
+          <div class="field" style="margin-top:8px">
+            <button class="btn sm" id="btn-refresh" style="flex:1">刷新订阅 <span id="sub-count" class="lbl"></span></button>
+            <button class="btn sm" id="btn-latency" style="flex:1">全部测速</button>
+          </div>
+          <div id="sub-msg" class="lbl" style="margin-top:9px"></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>运行参数</h2>
+        <div class="pad">
+          <dl class="kv">
+            <dt>本地端口</dt><dd id="v-port">2080</dd>
+            <dt>内核 PID</dt><dd id="v-pid">—</dd>
+            <dt>内核文档</dt><dd id="v-core" title="">—</dd>
+            <dt>系统代理</dt><dd id="v-sysproxy">—</dd>
+            <dt>崩溃重启</dt><dd id="v-restarts">0</dd>
+          </dl>
+          <div class="field" style="margin-top:11px">
+            <input id="port-input" type="number" min="1" max="65535" placeholder="2080" style="max-width:110px">
+            <button class="btn sm" id="btn-port">应用端口</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="notice" id="notice" hidden></div>
+    </aside>
+
+    <!-- ── 主区 ── -->
+    <main>
+      <section class="card route">
+        <div style="display:flex;align-items:baseline;gap:12px;margin-bottom:6px">
+          <h2 class="stage" style="margin:0">流量路径</h2>
+          <span class="lbl" id="route-note" style="margin-left:auto"></span>
+        </div>
+        <svg viewBox="0 0 900 210" role="img" aria-label="流量路径示意：应用进程经内核捕获后按规则分流到代理或直连">
+          <!-- 源 -->
+          <g>
+            <rect x="4" y="70" width="150" height="70" rx="3" fill="#102A1C" stroke="#2A5540"/>
+            <text x="79" y="97" text-anchor="middle" class="lane-tag" fill="#DEEBE3" style="font-size:11.5px">应用进程</text>
+            <text x="79" y="117" text-anchor="middle" class="lane-tag" fill="#5C7568" style="font-size:9.5px">PROCESS</text>
+          </g>
+          <!-- 捕获层 -->
+          <path class="trace live" id="tr-capture" d="M154 105 H 250"/>
+          <g>
+            <rect x="250" y="70" width="150" height="70" rx="3" fill="#102A1C" stroke="#2A5540"/>
+            <text x="325" y="97" text-anchor="middle" class="lane-tag" fill="#DEEBE3" style="font-size:11.5px">内核捕获</text>
+            <text x="325" y="117" text-anchor="middle" class="lane-tag" fill="#5C7568" style="font-size:9.5px" id="cap-mode">TUN / 系统代理</text>
+          </g>
+          <!-- 判定节点 -->
+          <path class="trace live" d="M400 105 H 470"/>
+          <circle class="via" cx="470" cy="105" r="5"/>
+          <text x="470" y="86" text-anchor="middle" class="lane-tag" fill="#C9A227" style="font-size:9.5px">规则判定</text>
+          <!-- 上车道：代理 -->
+          <path class="trace live flow" id="tr-proxy" d="M470 105 C 520 105 520 48 570 48 H 700"/>
+          <text x="700" y="44" class="lane-tag" fill="#4FE39A">PROXY → 节点</text>
+          <!-- 下车道：直连 -->
+          <path class="trace lane-dead" id="tr-direct" d="M470 105 C 520 105 520 162 570 162 H 700"/>
+          <text x="700" y="158" class="lane-tag" fill="#5C7568" id="direct-tag">DIRECT → 本地直连</text>
+          <text x="700" y="176" class="lane-tag" fill="#5C7568" style="font-size:9.5px" id="direct-sub">其余流量在此终结，不经过节点</text>
+          <!-- 出口 -->
+          <g>
+            <rect x="700" y="24" width="196" height="48" rx="3" fill="#102A1C" stroke="#2A5540"/>
+            <text x="798" y="46" text-anchor="middle" class="lane-tag" fill="#DEEBE3" style="font-size:11.5px" id="out-name">—</text>
+            <text x="798" y="63" text-anchor="middle" class="lane-tag" fill="#7C9989" style="font-size:9.5px" id="out-type">等待连接</text>
+          </g>
+        </svg>
+        <p class="lbl" style="margin:10px 0 0;line-height:1.75;font-size:10px">
+          捕获范围 ≠ 分流范围 —— 进程级 TUN 下内核捕获全部流量，规则决定哪些应用可以进入代理分流，
+          应用名单可反向选择，站点规则只作用于进入分流范围的应用。
+        </p>
+      </section>
+
+      <section class="card">
+        <h2>常用链接检测 <span class="nn" id="lk-nn">—</span></h2>
+        <div class="pad">
+          <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+            <button class="btn" id="btn-linkcheck">开始检测</button>
+            <label class="chk lbl"><input type="checkbox" id="auto-linkcheck" checked> 连接后自动检测</label>
+            <span class="lbl" id="lk-via" style="margin-left:auto"></span>
+          </div>
+          <div class="links" id="links"></div>
+          <div class="lk-verdict" id="lk-verdict" hidden></div>
+        </div>
+      </section>
+
+      <div class="cols">
+        <section class="card">
+          <h2>节点 <span class="nn" id="nodes-nn">0</span></h2>
+          <div id="nodes-box">
+            <div class="empty" id="nodes-empty">还没有节点。填入订阅链接并点「保存」。</div>
+            <table id="nodes-table" hidden>
+              <thead><tr><th>名称</th><th>协议</th><th>传输</th><th style="text-align:right">延迟</th></tr></thead>
+              <tbody id="nodes-body"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="card">
+          <h2>分流规则 <span class="nn" id="rules-nn">0</span></h2>
+          <!-- rules-in-main -->
+          <div class="pad">
+            <p class="lbl" style="margin:0 0 6px;line-height:1.7">
+              自定义规则优先于内置的国内直连判定。
+            </p>
+            <div class="rules" id="rules-list"></div>
+            <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:10px 0">
+              <select id="rules-import-mode" aria-label="规则导入方式">
+                <option value="append">追加规则并恢复应用设置</option>
+                <option value="replace">替换规则并恢复应用设置</option>
+              </select>
+              <button class="btn sm" id="rules-import">导入 JSON</button>
+              <button class="btn sm" id="rules-export">导出 JSON</button>
+              <input type="file" id="rules-file" accept=".json,application/json" hidden>
+            </div>
+            <div class="rule-add">
+              <select id="rule-type" aria-label="匹配类型">
+                <option value="domain">精确域名</option>
+                <option value="domain_suffix">域名后缀</option>
+                <option value="domain_keyword">域名关键词</option>
+                <option value="domain_regex">域名正则</option>
+                <option value="ip_cidr">IP 网段</option>
+                <option value="process_name">进程名</option>
+                <option value="process_path">进程路径</option>
+              </select>
+              <select id="rule-outbound" aria-label="出站">
+                <option value="proxy">走代理</option>
+                <option value="direct">直连</option>
+              </select>
+              <input id="rule-value" placeholder="匹配内容，如 .corp.internal">
+              <button class="btn sm" id="rules-add">添加</button>
+            </div>
+            <div id="rules-msg" class="lbl" role="status" style="margin-top:8px"></div>
+          </div>
+        </section>
+      </div>
+
+      <section class="card">
+        <h2>内核日志 <span class="nn"><button class="btn sm" id="btn-clear-log">清屏</button></span></h2>
+        <div class="log" id="log" aria-live="polite"></div>
+      </section>
+    </main>
+  </div>
+</div>
+
+<script type="module">
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+let state = null;
+let live = true;          // 是否连着真实引擎
+let sawLive = false;      // 是否曾经成功连上引擎（打包后要等 sidecar 冷启动）
+let bootTries = 0;
+
+// 接口基址：独立运行（node engine/server.mjs）时前后端同源，前缀为空；
+// 打包成桌面应用后前端由 Tauri 提供，接口仍在回环端口上，必须写全。
+const API_BASE = (() => {
+  const h = location.hostname;
+  return (h === '127.0.0.1' || h === 'localhost') && location.port ? '' : 'http://127.0.0.1:7788';
+})();
+let latency = {};
+let selected = 0;
+let linkAtSeen = null;    // 已绘制过的检测结果时间戳
+
+// ── 通信 ────────────────────────────────────────────────────────────────
+async function api(path, body) {
+  const res = await fetch(API_BASE + path, {
+    method: body === undefined ? 'GET' : 'POST',
+    headers: body === undefined ? {} : { 'Content-Type': 'application/json' },
+    body: body === undefined ? undefined : JSON.stringify(body ?? {}),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const err = new Error(data.error || ('HTTP ' + res.status));
+    // 需要提权时直接把「为什么 + 怎么办」写进日志：用户不必去猜
+    // 「权限不足」到底缺的是哪个权限。
+    err.code = data.code;
+    err.privilege = data.privilege;
+    if (data.code === 'NEED_ELEVATION' && data.privilege) {
+      logLine(data.privilege.hint || data.error, 'warn');
+      if (data.privilege.elevation?.command) {
+        logLine('提权重启命令：' + data.privilege.elevation.command, 'sys');
+      }
+    }
+    throw err;
+  }
+  return data;
+}
+
+const DEMO = {
+  subscription: {
+    hasUrl: true, url: 'https://demo.invalid/…', updatedAt: new Date(Date.now() - 3.2e6).toISOString(),
+    nodes: [
+      { name: 'HK-CN2-01', type: 'vless', server: '198.51.100.11', server_port: 443, security: 'reality', flow: 'xtls-rprx-vision', transport: 'tcp' },
+      { name: 'HK-CN2-02', type: 'vless', server: '198.51.100.12', server_port: 443, security: 'reality', flow: 'xtls-rprx-vision', transport: 'tcp' },
+      { name: 'JP-OSAKA-01', type: 'vless', server: '198.51.100.31', server_port: 8443, security: 'reality', flow: 'xtls-rprx-vision', transport: 'tcp' },
+      { name: 'US-LA-03', type: 'trojan', server: '198.51.100.51', server_port: 443, security: 'tls', flow: null, transport: 'ws' },
+    ],
+    lastChange: { added: [], removed: [], changed: [{ name: 'HK-CN2-01', from: '198.51.100.11:443', to: '198.51.100.19:8443' }] },
+  },
+  settings: { selected: 0, mode: 'sysproxy', port: 2080, autoRefreshMinutes: 360, apps: ['antigravity'] },
+  status: { connected: true, running: true, pid: 40412, uptimeMs: 42 * 60_000, restarts: 1, mode: 'sysproxy', port: 2080, node: 'HK-CN2-01', nodeCount: 4, pointingAtUs: true, pendingProxyJournal: true, coreBinary: '/usr/local/bin/sing-box' },
+};
+const DEMO_LAT = { 'HK-CN2-01': { ok: true, delay: 38 }, 'HK-CN2-02': { ok: true, delay: 41 }, 'JP-OSAKA-01': { ok: true, delay: 76 }, 'US-LA-03': { ok: false, error: '超时' } };
+
+// ── 渲染 ────────────────────────────────────────────────────────────────
+function fmtUptime(ms) {
+  if (!ms || ms < 1000) return '—';
+  const s = Math.floor(ms / 1000), m = Math.floor(s / 60), h = Math.floor(m / 60);
+  if (h) return `${h} 小时 ${m % 60} 分`;
+  if (m) return `${m} 分 ${s % 60} 秒`;
+  return `${s} 秒`;
+}
+
+function render() {
+  const st = state.status || {};
+  const set = state.settings || {};
+  const nodes = state.subscription?.nodes || [];
+  selected = set.selected ?? 0;
+
+  // 状态胶囊
+  const busy = st.busy;
+  $('d-status').className = 'dot' + (busy ? ' busy' : st.connected ? ' on' : (st.pendingProxyJournal ? ' warn' : ''));
+  $('t-status').textContent = busy ? (busy === 'connect' ? '正在连接…' : '正在断开…')
+    : st.connected ? '已连接' : (st.pendingProxyJournal ? '待自愈' : '未连接');
+  $('t-node').textContent = st.node || '—';
+  $('t-uptime').textContent = st.connected ? fmtUptime(st.uptimeMs) : '—';
+
+  // 主控按钮
+  const btn = $('btn-toggle');
+  btn.disabled = Boolean(busy) || nodes.length === 0;
+  btn.className = 'primary' + (st.connected ? '' : ' off');
+  $('glyph').textContent = st.connected ? '■' : '▶';
+  $('btn-label').textContent = st.connected ? '断开' : '连接';
+  $('btn-sub').textContent = `${set.mode === 'tun-per-app' ? '进程级 TUN' : '系统代理'} · 端口 ${set.port}`;
+
+  // 模式
+  $('mode-sysproxy').setAttribute('aria-pressed', String(set.mode !== 'tun-per-app'));
+  $('mode-tun-per-app').setAttribute('aria-pressed', String(set.mode === 'tun-per-app'));
+  const rm = set.routingMode || 'rule';
+  $('rm-rule').setAttribute('aria-pressed', String(rm === 'rule'));
+  $('rm-global').setAttribute('aria-pressed', String(rm === 'global'));
+  $('rm-direct').setAttribute('aria-pressed', String(rm === 'direct'));
+  $('routing-hint').textContent = rm === 'rule'
+    ? '规则：国内地址直连、并用本地 DNS 就近解析；其余走代理。'
+    : rm === 'global'
+      ? '全局：所有流量都走代理，国内站点也会绕行。'
+      : '直连：客户端保持运行但不使用代理，全部本地解析。';
+  $('apps-wrap').hidden = set.mode !== 'tun-per-app';
+  $('mode-hint').textContent = set.mode === 'tun-per-app'
+    ? '需管理员权限。应用名单决定分流范围，站点规则决定直连或代理。'
+    : '系统代理：零提权，遵守系统代理的应用生效。';
+  if (set.mode === 'tun-per-app') {
+    $('reverse-apps').checked = set.reverseApps === true;
+    $('apps-hint').textContent = set.reverseApps ? '名单内应用直连，名单外按站点规则分流' : '名单内应用按站点规则分流，名单外直连';
+    $('apps').innerHTML = Object.entries({ antigravity: 'Google Antigravity', vscode: 'VS Code', chrome: 'Google Chrome' })
+      .map(([key, label]) => `<label class="chk lbl"><input type="checkbox" data-app="${key}" ${(set.apps || []).includes(key) ? 'checked' : ''}>${label}</label>`).join('');
+  }
+
+  // 订阅
+  $('sub-updated').textContent = state.subscription?.updatedAt
+    ? new Date(state.subscription.updatedAt).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })
+    : '—';
+  $('sub-count').textContent = nodes.length ? `${nodes.length} 个` : '';
+  if (state.subscription?.hasUrl && !$('sub-url').value) $('sub-url').placeholder = `已保存：${state.subscription.url}`;
+
+  // 参数
+  $('v-port').textContent = set.port;
+  $('v-pid').textContent = st.pid ?? '—';
+  $('v-core').textContent = st.coreBinary ? st.coreBinary.split('/').pop() : '未找到';
+  $('v-core').title = st.coreBinary || '';
+  $('v-sysproxy').textContent = st.connected ? (st.pointingAtUs ? '已指向本机' : '未生效') : (st.pendingProxyJournal ? '有残留' : '未改动');
+  $('v-restarts').textContent = st.restarts ?? 0;
+  if (!$('port-input').value) $('port-input').placeholder = String(set.port);
+
+  // 提示条
+  const changes = state.subscription?.lastChange?.changed || [];
+  const msgs = [];
+  if (st.pendingProxyJournal && !st.connected) msgs.push('检测到上次未清理的系统代理残留，重启引擎时将自动还原。');
+  if (changes.length) msgs.push(`${changes.length} 个节点入口参数已轮换（例：${changes[0].name} ${changes[0].from} → ${changes[0].to}）。请点「刷新订阅」。`);
+  if (!live) msgs.push('当前显示的是演示数据：未连接到引擎 API。');
+  $('notice').hidden = msgs.length === 0;
+  $('notice').innerHTML = msgs.map(esc).join('<br>');
+  $('demo-badge').hidden = live;
+
+  renderRoute(st, set, nodes);
+  renderRules(set.customRules);
+  renderNodes(nodes, st);
+}
+
+function renderRoute(st, set, nodes) {
+  const perApp = set.mode === 'tun-per-app';
+  $('cap-mode').textContent = perApp ? 'TUN 全量捕获' : '系统代理';
+  // 直连车道：进程级模式下是真实的分流结果；系统代理模式下由应用自行决定
+  const directLive = perApp;
+  $('tr-direct').setAttribute('class', 'trace ' + (directLive ? 'flow' : 'lane-dead'));
+  $('direct-tag').style.fill = directLive ? '#4FE39A' : '#5C7568';
+  $('direct-sub').textContent = directLive ? (set.reverseApps ? '名单内应用直连，不经过节点' : '名单外应用直连，不经过节点') : '未走系统代理的应用，不经过内核';
+  $('tr-capture').setAttribute('class', 'trace ' + (st.connected ? 'live' : ''));
+  $('tr-proxy').setAttribute('class', 'trace ' + (st.connected ? 'live flow' : 'lane-dead'));
+  $('route-note').textContent = st.connected
+    ? (perApp ? (set.reverseApps ? '捕获全部 · 名单外按规则分流' : '捕获全部 · 名单内按规则分流') : '全部走代理 · 应用自行决定是否遵守')
+    : '未连接';
+
+  const node = nodes[selected];
+  $('out-name').textContent = st.connected ? (st.node || '—') : '未连接';
+  $('out-type').textContent = node ? `${node.type.toUpperCase()} · ${node.security || 'none'}${node.flow ? ' · ' + node.flow : ''}` : '等待连接';
+  $('out-name').style.fill = st.connected ? '#DEEBE3' : '#5C7568';
+}
+
+function renderNodes(nodes, st) {
+  $('nodes-nn').textContent = nodes.length;
+  $('nodes-empty').hidden = nodes.length > 0;
+  $('nodes-table').hidden = nodes.length === 0;
+  if (!nodes.length) return;
+
+  $('nodes-body').innerHTML = nodes.map((n, i) => {
+    const r = latency[n.name];
+    let cls = 'rtt na', txt = '—';
+    if (r) {
+      if (r.ok) { cls = 'rtt'; txt = r.delay + ' ms'; }
+      else { cls = 'rtt bad'; txt = r.error; }
+    }
+    const sel = i === selected ? 'true' : 'false';
+    return `<tr class="node" data-i="${i}" aria-selected="${sel}" tabindex="0">
+      <td class="nm" title="${esc(n.server)}:${n.server_port}">${esc(n.name)}</td>
+      <td><span class="tag">${esc((n.type || '').toUpperCase())}</span></td>
+      <td style="color:#8AA396">${esc(n.transport || 'tcp')}</td>
+      <td class="${cls}">${esc(txt)}</td>
+    </tr>`;
+  }).join('');
+}
+
+function logLine(text, kind = '') {
+  const el = $('log');
+  const atBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - 24;
+  const div = document.createElement('div');
+  if (kind) div.className = 'l-' + kind;
+  div.textContent = text;
+  el.appendChild(div);
+  while (el.childElementCount > 400) el.removeChild(el.firstChild);
+  if (atBottom) el.scrollTop = el.scrollHeight;
+}
+
+// ── 动作 ────────────────────────────────────────────────────────────────
+async function load() {
+  try {
+    state = await api('/api/state');
+    live = true;
+    sawLive = true;
+    bootTries = 0;
+    if (!state.status) state.status = {};
+    latency = state.latency || {};
+    render();
+    // 链接检测结果只在变化时重绘，避免把"检测中"的动效刷掉
+    if (state.linkCheck && state.linkCheck.at !== linkAtSeen) {
+      linkAtSeen = state.linkCheck.at;
+      renderLinks(state.linkCheck);
+    } else if (!state.linkCheck && linkAtSeen === null) {
+      renderLinks(null);
+      linkAtSeen = 0;
+    }
+  } catch (e) {
+    // 打包后窗口会先于引擎（sidecar）就绪，这几百毫秒必须等 ——
+    // 否则会先闪一下演示数据，用户会以为已经连上了。
+    if (!sawLive && bootTries < 60) {
+      bootTries += 1;
+      if (bootTries === 1) logLine('正在启动本地引擎…', 'sys');
+      setTimeout(load, 400);
+      return;
+    }
+    if (live) logLine('未连接到引擎 API，切换到演示数据：' + e.message, 'warn');
+    live = false;
+    state = JSON.parse(JSON.stringify(DEMO));
+    latency = DEMO_LAT;
+    render();
+  }
+}
+
+function flash(el, msg, kind = '') {
+  el.textContent = msg;
+  el.style.color = kind === 'err' ? 'var(--danger)' : 'var(--gold-hi)';
+}
+
+async function act(fn) {
+  try {
+    return await fn();
+  } catch (e) {
+    logLine(e.message, 'err');
+    if (live) { try { await load(); } catch {} }
+    return null;
+  }
+}
+
+$('btn-toggle').addEventListener('click', () => act(async () => {
+  const connected = state.status?.connected;
+  if (!live) { logLine('演示模式：仅展示交互，不会真的连接。', 'sys'); return; }
+  logLine(connected ? '断开中…' : '连接中…', 'sys');
+  const out = connected ? await api('/api/disconnect', {}) : await api('/api/connect', {});
+  await load();
+  logLine(connected ? '已断开，系统代理已还原。' : `已连接 → ${out.node}（pid ${out.pid}）`, 'sys');
+}));
+
+$('mode-sysproxy').addEventListener('click', () => act(async () => {
+  if (!live) return;
+  await api('/api/settings', { settings: { mode: 'sysproxy' } });
+  await load();
+}));
+for (const [id, mode] of [['rm-rule', 'rule'], ['rm-global', 'global'], ['rm-direct', 'direct']]) {
+  $(id).addEventListener('click', () => act(async () => {
+    if (!live) { state.settings.routingMode = mode; render(); return; }
+    const out = await api('/api/routing-mode', { mode });
+    await load();
+    logLine(
+      out.applied
+        ? `路由模式已切换为「${mode}」（内核确认 mode=${out.confirmed}，无需重连）`
+        : `路由模式已设为「${mode}」：${out.reason}`,
+      out.applied ? 'sys' : 'warn',
+    );
+  }));
+}
+
+$('mode-tun-per-app').addEventListener('click', () => act(async () => {
+  if (!live) return;
+  await api('/api/settings', { settings: { mode: 'tun-per-app' } });
+  await load();
+  logLine('已切换为进程级 TUN。运行需管理员权限，且需要内核重启后生效。', 'warn');
+}));
+
+$('btn-save').addEventListener('click', () => act(async () => {
+  const url = $('sub-url').value.trim();
+  if (!url) return flash($('sub-msg'), '请填入订阅链接', 'err');
+  flash($('sub-msg'), '拉取中…');
+  const out = await api('/api/subscription', { url });
+  $('sub-url').value = '';
+  await load();
+  flash($('sub-msg'), out.summary ? out.summary : `已更新，共 ${out.nodes} 个节点`);
+  logLine(`订阅已更新：${out.nodes} 个节点` + (out.summary ? '，' + out.summary : ''), 'sys');
+  if (out.change?.changed?.length) {
+    out.change.changed.forEach((c) => logLine(`入口轮换：${c.name}  ${c.from} → ${c.to}`, 'warn'));
+  }
+}));
+
+$('btn-refresh').addEventListener('click', () => act(async () => {
+  if (!live) return logLine('演示模式：无法刷新。', 'sys');
+  flash($('sub-msg'), '刷新中…');
+  const out = await api('/api/refresh', { force: true });
+  await load();
+  flash($('sub-msg'), out.notModified ? '服务端未变更' : `已更新，共 ${out.nodes} 个节点`);
+}));
+
+$('btn-latency').addEventListener('click', () => act(async () => {
+  if (!live) { logLine('演示模式：延迟为示例数值。', 'sys'); return; }
+  logLine('测速中（内核实际发起连接）…', 'sys');
+  latency = (await api('/api/latency', { all: true })).latency || {};
+  render();
+  const ok = Object.values(latency).filter((v) => v.ok).length;
+  logLine(`测速完成：${ok}/${Object.keys(latency).length} 个节点可用`, ok ? 'sys' : 'warn');
+}));
+
+$('nodes-body').addEventListener('click', (e) => {
+  const tr = e.target.closest('tr.node');
+  if (!tr) return;
+  selectNode(Number(tr.dataset.i));
+});
+$('nodes-body').addEventListener('keydown', (e) => {
+  if (e.key !== 'Enter' && e.key !== ' ') return;
+  const tr = e.target.closest('tr.node');
+  if (!tr) return;
+  e.preventDefault();
+  selectNode(Number(tr.dataset.i));
+});
+
+async function selectNode(i) {
+  await act(async () => {
+    selected = i;
+    if (!live) { state.settings.selected = i; render(); return; }
+    const out = await api('/api/settings', { settings: { selected: i } });
+    await load();
+    const node = state.subscription.nodes[i];
+    logLine(`已选择节点：${node.name}`);
+    if (out && state.status?.connected) {
+      // 内核在跑 → 走 selector 即时切换
+      logLine('正在通过内核接口即时切换出站…', 'sys');
+    }
+  });
+}
+
+$('btn-port').addEventListener('click', () => act(async () => {
+  const p = Number($('port-input').value);
+  if (!p || p < 1 || p > 65535) return flash($('sub-msg'), '端口无效', 'err');
+  if (!live) return;
+  await api('/api/settings', { settings: { port: p } });
+  $('port-input').value = '';
+  await load();
+  logLine(`本地端口改为 ${p}，重新连接后生效。`, 'warn');
+}));
+
+$('btn-clear-log').addEventListener('click', () => { $('log').innerHTML = ''; });
+
+// ── 常用链接检测 ────────────────────────────────────────────────────────
+const GROUP_LABEL = { control: '对照组', blocked: '常用站点', local: '本机' };
+// 默认状态也要把"会检测哪些站点"摆出来 —— 空白卡片看起来像功能坏了
+const DEFAULT_LINK_LABELS = [
+  ['Google', '常用站点'], ['YouTube', '常用站点'], ['GitHub', '常用站点'], ['X', '常用站点'],
+  ['OpenAI', '常用站点'], ['维基百科', '常用站点'], ['Cloudflare', '对照组'],
+];
+
+function renderLinks(data) {
+  const box = $('links');
+  if (!data) {
+    box.innerHTML = DEFAULT_LINK_LABELS
+      .map(([label, group]) =>
+        `<div class="lk"><div class="n"><i class="d"></i>${label}</div><div class="m">待检测</div><div class="g">${group}</div></div>`)
+      .join('');
+    $('lk-via').textContent = '';
+    $('lk-nn').textContent = '待检测';
+    return;
+  }
+
+  const viaProxy = data.via === 'proxy';
+  $('lk-via').textContent = viaProxy ? `经代理端口 ${data.port}` : '直连检测（未经过代理）';
+
+  box.innerHTML = data.results.map((r) => {
+    const cls = r.ok ? 'ok' : 'bad';
+    const detail = r.ok
+      ? `HTTP ${r.status} · ${r.latencyMs} ms`
+      : `${r.error}${r.direct ? (r.direct.ok ? ' · 直连可达' : ' · 直连亦不可达') : ''}`;
+    const group = GROUP_LABEL[r.group] || r.group;
+    return `<div class="lk ${cls}" title="${esc(r.url)}">
+      <div class="n"><i class="d"></i>${esc(r.label)}</div>
+      <div class="m">${esc(detail)}</div>
+      <div class="g">${esc(group)}</div>
+    </div>`;
+  }).join('');
+
+  const s = data.summary;
+  const v = $('lk-verdict');
+  v.hidden = false;
+  v.className = 'lk-verdict ' + s.level;
+  $('lk-nn').textContent = `${s.ok}/${s.total} 可达`;
+
+  const diags = data.results.filter((r) => r.diagnosis).map((r) => `${r.label}：${r.diagnosis}`);
+  v.innerHTML =
+    esc(s.verdict) +
+    (s.avgLatencyMs ? `（平均 ${s.avgLatencyMs} ms）` : '') +
+    (diags.length ? `<span class="diag">${diags.map(esc).join('　·　')}</span>` : '');
+}
+
+function renderLinksPending() {
+  $('links').innerHTML = ['Google', 'YouTube', 'GitHub', 'X', 'OpenAI', '维基百科', 'Cloudflare']
+    .map((n) => `<div class="lk pending"><div class="n"><i class="d"></i>${n}</div><div class="m">检测中…</div><div class="g">&nbsp;</div></div>`)
+    .join('');
+  $('lk-verdict').hidden = true;
+  $('lk-nn').textContent = '检测中';
+}
+
+async function runLinkCheck() {
+  if (!live) {
+    logLine('演示模式：不会真的发起检测。', 'sys');
+    renderLinks({
+      at: Date.now(), via: 'proxy', port: 2080,
+      results: [
+        { id: 'google', label: 'Google', url: 'https://www.google.com/generate_204', group: 'blocked', ok: true, status: 204, latencyMs: 38 },
+        { id: 'youtube', label: 'YouTube', url: 'https://www.youtube.com/generate_204', group: 'blocked', ok: true, status: 204, latencyMs: 64 },
+        { id: 'github', label: 'GitHub', url: 'https://github.com/', group: 'blocked', ok: true, status: 200, latencyMs: 112 },
+        { id: 'x', label: 'X', url: 'https://x.com/', group: 'blocked', ok: false, error: '超时', direct: { ok: false }, diagnosis: '直连同样不可达 → 目标本身受限，与代理无关' },
+        { id: 'openai', label: 'OpenAI', url: 'https://chatgpt.com/', group: 'blocked', ok: true, status: 403, latencyMs: 143 },
+        { id: 'wikipedia', label: '维基百科', url: 'https://zh.wikipedia.org/', group: 'blocked', ok: true, status: 200, latencyMs: 88 },
+        { id: 'cloudflare', label: 'Cloudflare', url: 'https://www.cloudflare.com/cdn-cgi/trace', group: 'control', ok: true, status: 200, latencyMs: 51 },
+      ],
+      summary: { total: 7, ok: 6, failed: 1, failedLabels: ['X'], avgLatencyMs: 83, controlOk: true, verdict: '部分站点不可达（1/7）—— 链路是通的，可能是出口 IP 被针对性识别', level: 'warn' },
+    });
+    return;
+  }
+  renderLinksPending();
+  $('btn-linkcheck').disabled = true;
+  logLine('开始检测常用站点（经代理端口）…', 'sys');
+  try {
+    const data = await api('/api/linkcheck', { timeoutMs: 8000 });
+    renderLinks(data);
+    const s = data.summary;
+    logLine(`检测完成：${s.ok}/${s.total} 可达 · ${s.verdict}`, s.level === 'ok' ? 'sys' : 'warn');
+  } finally {
+    $('btn-linkcheck').disabled = false;
+  }
+}
+
+$('btn-linkcheck').addEventListener('click', () => act(runLinkCheck));
+$('auto-linkcheck').addEventListener('change', (e) => {
+  try { localStorage.setItem('jms.autoLinkCheck', e.target.checked ? '1' : '0'); } catch {}
+});
+try { if (localStorage.getItem('jms.autoLinkCheck') === '0') $('auto-linkcheck').checked = false; } catch {}
+
+// ── 分流规则编辑器 ──────────────────────────────────────────────────────
+const RULE_TYPE_LABEL = {
+  domain: '精确域名', domain_suffix: '域名后缀', domain_keyword: '域名关键词',
+  domain_regex: '域名正则', ip_cidr: 'IP 网段', process_name: '进程名', process_path: '进程路径',
+};
+
+function renderRules(rules) {
+  const list = rules || [];
+  $('rules-nn').textContent = list.length;
+  $('rules-list').innerHTML = list.length
+    ? list.map((r, i) => `<div class="rule">
+        <span class="tag">${esc(RULE_TYPE_LABEL[r.type] || r.type)}</span>
+        <span class="rv" title="${esc(r.value)}">${esc(r.value)}</span>
+        <span class="ro ${r.outbound === 'direct' ? 'd' : 'p'}">${r.outbound === 'direct' ? '直连' : '代理'}</span>
+        <button class="del" data-i="${i}" title="删除">✕</button>
+      </div>`).join('')
+    : '<div class="lbl" style="padding:2px">还没有自定义规则。内置的「国内直连」判定始终生效。</div>';
+}
+
+$('reverse-apps').addEventListener('change', () => act(async () => {
+  await api('/api/settings', { settings: { reverseApps: $('reverse-apps').checked } });
+  await load();
+  flash($('rules-msg'), '应用名单方向已保存，重新连接后生效。');
+}));
+$('apps').addEventListener('change', () => act(async () => {
+  const apps = [...$('apps').querySelectorAll('input:checked')].map(el => el.dataset.app);
+  await api('/api/settings', { settings: { apps } });
+  await load();
+  flash($('rules-msg'), '应用名单已保存，重新连接后生效。');
+}));
+
+$('rules-export').addEventListener('click', () => act(async () => {
+  if (!live) return flash($('rules-msg'), '请先连接引擎后导出规则', 'err');
+  const doc = await api('/api/rules');
+  const url = URL.createObjectURL(new Blob([JSON.stringify(doc, null, 2) + '\n'], { type: 'application/json' }));
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = 'jms-rules.json';
+  document.body.append(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  flash($('rules-msg'), `已导出 ${doc.rules.length} 条自定义规则`);
+}));
+
+$('rules-import').addEventListener('click', () => {
+  if (!live) return flash($('rules-msg'), '请先连接引擎后导入规则', 'err');
+  $('rules-file').click();
+});
+$('rules-file').addEventListener('change', () => act(async () => {
+  const file = $('rules-file').files[0];
+  $('rules-file').value = '';
+  if (!file) return;
+  try {
+    if (file.size > 128 * 1024) throw new Error('规则文件不能超过 128 KB');
+    const mode = $('rules-import-mode').value;
+    const text = await file.text();
+    if (mode === 'replace' && !confirm('将替换全部站点规则，并恢复文件中的应用名单及开关状态，是否继续？')) return;
+    const result = await api('/api/rules/import', { text, mode });
+    await load();
+    flash($('rules-msg'), `已导入 ${result.imported} 条，跳过 ${result.duplicates} 条重复规则，共 ${result.total} 条。重新连接后生效。`);
+  } catch (e) {
+    flash($('rules-msg'), e.message, 'err');
+  }
+}));
+
+$('rules-add').addEventListener('click', () => act(async () => {
+  const type = $('rule-type').value;
+  const value = $('rule-value').value.trim();
+  const outbound = $('rule-outbound').value;
+  if (!value) return flash($('rules-msg'), '匹配内容不能为空', 'err');
+
+  const cur = (state.settings.customRules || []).slice();
+  cur.push({ type, value, outbound, id: `${type}:${value}:${outbound}`, enabled: true });
+
+  if (!live) { state.settings.customRules = cur; render(); $('rule-value').value = ''; return; }
+  await api('/api/settings', { settings: { customRules: cur } });
+  $('rule-value').value = '';
+  await load();
+  flash($('rules-msg'), '已添加。规则改动需要重新连接后生效。');
+  logLine(`新增分流规则：${RULE_TYPE_LABEL[type] || type} ${value} → ${outbound === 'direct' ? '直连' : '代理'}`, 'sys');
+}));
+
+$('rules-list').addEventListener('click', (e) => {
+  const btn = e.target.closest('button.del');
+  if (!btn) return;
+  act(async () => {
+    const cur = (state.settings.customRules || []).slice();
+    const [removed] = cur.splice(Number(btn.dataset.i), 1);
+    if (!live) { state.settings.customRules = cur; render(); return; }
+    await api('/api/settings', { settings: { customRules: cur } });
+    await load();
+    flash($('rules-msg'), '已删除。需要重新连接后生效。');
+    logLine(`删除分流规则：${removed ? removed.value : ''}`, 'sys');
+  });
+});
+
+// ── 事件流 ──────────────────────────────────────────────────────────────
+function connectEvents() {
+  try {
+    const es = new EventSource(API_BASE + '/api/events');
+    es.addEventListener('warn', (e) => logLine(JSON.parse(e.data) || '警告', 'warn'));
+    es.addEventListener('healed', (e) => logLine('已自愈：还原上次异常退出留下的系统代理设置', 'sys'));
+    es.addEventListener('connected', (e) => {
+      logLine('内核已启动', 'sys');
+      // 连接成功后自动验证一次：这正是用户最想知道"到底通没通"的时刻
+      if ($('auto-linkcheck').checked) setTimeout(() => runLinkCheck().catch(() => {}), 800);
+    });
+    es.addEventListener('disconnected', () => logLine('内核已停止', 'sys'));
+    es.addEventListener('restarted', (e) => logLine('内核已自动重启：' + JSON.stringify(JSON.parse(e.data)), 'warn'));
+    es.addEventListener('gaveup', () => { logLine('内核连续启动失败，已停止重试并还原系统代理', 'err'); load(); });
+    es.addEventListener('core-log', (e) => {
+      const line = JSON.parse(e.data);
+      logLine(line.replace(/\x1b\[[0-9;]*m/g, ''), /ERROR|FATAL/.test(line) ? 'err' : '');
+    });
+    es.onerror = () => { /* 引擎未运行时静默 */ };
+  } catch { /* ignore */ }
+}
+
+// ── 启动 ────────────────────────────────────────────────────────────────
+logLine('JMS 控制台就绪。填入订阅链接后点「保存」。', 'sys');
+await load();
+if (live) connectEvents();
+setInterval(() => { if (live && !state.status?.busy) load(); }, 3000);
+</script>
+</body>
+</html>

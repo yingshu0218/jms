@@ -1,0 +1,5 @@
+.DS_Store
+Thumbs.db
+app/macos/.build/
+app/macos/.swiftpm/
+app/dist/

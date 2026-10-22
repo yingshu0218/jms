@@ -1,0 +1,39 @@
+[package]
+name = "jms-client"
+version = "0.2.0"
+description = "JMS 代理客户端 · 桌面外壳"
+edition = "2021"
+rust-version = "1.77"
+
+[lib]
+name = "jms_client_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# 托盘图标需要 tray-icon；image-png 用于解码图标资源
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+
+# 拉起 Node 引擎（sidecar 进程）并读取它的输出
+tauri-plugin-shell = "2"
+
+# 第二个实例直接唤醒已有窗口，而不是起第二个引擎去抢同一个端口
+tauri-plugin-single-instance = "2"
+
+# 开机自启（三平台各自的正确做法都由它处理）
+tauri-plugin-autostart = "2"
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# 只发回环 HTTP，不需要 TLS —— 因此关掉默认特性，明显缩短编译时间、减小产物体积
+reqwest = { version = "0.12", default-features = false, features = ["json", "blocking"] }
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"
+strip = true

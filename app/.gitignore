@@ -1,0 +1,25 @@
+# 依赖与构建产物
+node_modules/
+build/
+
+# Tauri
+src-tauri/target/
+src-tauri/gen/
+src-tauri/binaries/
+
+# 注意：src-tauri/icons/ 下的图标**必须进仓库** —— CI 编译 Tauri 时需要它们。
+# 只有体积大的 sidecar 和内核才排除。
+
+# 随包内核：体积大，且要按平台分别下载
+src-tauri/resources/core/sing-box
+src-tauri/resources/core/sing-box.exe
+
+# 运行时状态：含订阅链接、uuid、Reality 公钥 —— 绝不能进仓库
+var/
+*.log
+app.lock
+cache.db*
+
+# 系统文件
+.DS_Store
+Thumbs.db
