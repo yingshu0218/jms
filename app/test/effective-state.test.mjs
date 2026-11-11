@@ -114,3 +114,9 @@ test('API已生效而启动配置提交失败：不假报持久化并暂停自�
   assert.equal((await app.status()).effective.routingMode,'global');assert.equal(readdirSync(app.varDir).some(name=>name.includes('.pending')),false);
  } finally {rmSync(file,{recursive:true});renameSync(backup,file);}
 });
+test('API确认成功但自有PID已变，不能提交旧进程的切换结果',async t=>{
+ const {app,api,state}=await setup(t);const before=readFileSync(app.store.file,'utf8'),config=readFileSync(join(app.varDir,'config-sysproxy.json'),'utf8');
+ api.setMode=async mode=>{state.mode=mode;app.supervisor.pid++;};
+ const result=await app.setRoutingMode('global');assert.equal(result.code,'STALE_SESSION');assert.equal(result.applied,false);
+ assert.equal(readFileSync(app.store.file,'utf8'),before);assert.equal(readFileSync(join(app.varDir,'config-sysproxy.json'),'utf8'),config);
+});

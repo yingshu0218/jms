@@ -27,7 +27,7 @@ import { runLinkCheck, DEFAULT_TARGETS } from './linkcheck.mjs';
 import { checkTunPrivilege, needsElevation, planElevation, relaunchArguments } from './privilege.mjs';
 
 const emptyEffective = () => ({ selected: null, routingMode: null, node: null, selectionTag: null, known: false, selectionKnown: false, modeKnown: false });
-const canonicalMode = value => typeof value === 'string' && ROUTING_MODES.includes(value.toLowerCase()) ? value.toLowerCase() : null;
+const canonicalMode = value => typeof value === 'string' && ROUTING_MODES.includes(value.trim().toLowerCase()) ? value.trim().toLowerCase() : null;
 
 export class AppService extends EventEmitter {
   constructor({ dir, coreBinary, adapter, clashApiFactory, latencyCoreRunner = withLatencyCore, isolated = false, controlPort = 7788, supervisorFactory, portsAvailable = assertPortsAvailable, ruleSetProvider = ensureRuleSets, listenerOwnership = assertListenerOwnership } = {}) {
@@ -119,9 +119,11 @@ export class AppService extends EventEmitter {
   }
 
   // ── 状态 ───────────────────────────────────────────────────────────────
-  apiClient() {
+  apiClient(token = this.#sessionToken()) {
     const addr = (this.sessionSettings || this.store.state.settings).clashApi;
-    return this.clashApiFactory(addr.startsWith('http') ? addr : `http://${addr}`, { secret: this.coreSecret });
+    return this.clashApiFactory(addr.startsWith('http') ? addr : `http://${addr}`, {
+      secret: this.coreSecret, assertCurrent: () => this.#assertSession(token),
+    });
   }
 
   async connections() {

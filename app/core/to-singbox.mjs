@@ -316,7 +316,10 @@ export function buildConfig(nodes, opts = {}) {
       // ★ 一旦配置了 dns 段，sing-box 1.12+ 就要求显式指定域名解析器；
       // 1.14 起缺失会**直接拒绝启动**（实测 FATAL: missing `route.default_domain_resolver`）。
       default_domain_resolver: 'local',
-      rules,
+      // sing-box derives its available Clash modes from rule references and
+      // default_mode. Declare all modes using real terminal fallbacks with the
+      // same outbound as final, so cold-start mode cannot remove hot switches.
+      rules: [...rules, ...ROUTING_MODES.map(clash_mode => ({ clash_mode, outbound: SELECTOR_TAG }))],
       final: SELECTOR_TAG,
     },
   };

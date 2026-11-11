@@ -32,15 +32,15 @@ test('TUN：兜底必须是直连 —— 没这条就没有「按应用分流」
   assert.equal(config.route.final, 'direct');
 });
 
-test('TUN：目标应用兜底走代理，且必须在最后一条路由规则', () => {
+test('TUN：目标应用兜底走代理，位于模式等价兜底之前', () => {
   const { config } = build();
-  const last = routeRules(config).at(-1);
+  const last = routeRules(config).slice(0, -3).at(-1);
   assert.deepEqual(last, { process_name: NAMES, outbound: SELECTOR_TAG });
 });
 
 test('TUN：每条分流规则都限定在目标进程上，绝不误伤其他应用', () => {
   const { config } = build();
-  for (const r of routeRules(config)) {
+  for (const r of routeRules(config).slice(0, -3)) {
     // sniff / hijack-dns 是动作规则，不参与分流判定
     if (r.action || r.inbound?.includes('mixed-in')) continue;
     assert.deepEqual(r.process_name, NAMES, `规则没有进程限定：${JSON.stringify(r)}`);
@@ -238,7 +238,7 @@ test('正向名单：名单外直连优先于所有用户规则', () => {
 test('空应用名单：正向全部直连，反向全部按规则分流', () => {
   const normal = buildTunPerAppConfig(NODES, { apps: [] }).config;
   assert.equal(normal.route.final, 'direct');
-  assert.equal(normal.route.rules.filter(r => r.outbound && !r.inbound).length, 0);
+  assert.equal(normal.route.rules.slice(0, -3).filter(r => r.outbound && !r.inbound).length, 0);
   assert.equal(normal.dns.final, 'local');
   const reverse = buildTunPerAppConfig(NODES, { apps: [], reverseApps: true }).config;
   assert.equal(reverse.route.final, 'proxy');

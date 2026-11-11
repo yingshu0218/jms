@@ -164,7 +164,7 @@ export function buildTunPerAppConfig(nodes, opts = {}) {
       : []),
 
     // ⑥ 目标应用兜底 → 代理。
-    //    放在最后是有意的：非目标应用不会被这条匹配到，直接落到下面的 final: 'direct'。
+    //    应用分流末尾兜底；名单外不匹配，继续到与 final 等价的模式兜底。
     { process_name: processNames, outbound: SELECTOR_TAG },
   ];
 
@@ -193,6 +193,11 @@ export function buildTunPerAppConfig(nodes, opts = {}) {
   // 模式及自定义直连规则，失败只能体现为代理失败，不能被直连成功掩盖。
   rules.unshift({ inbound: ['mixed-in'], outbound: SELECTOR_TAG });
   dns.rules.unshift({ inbound: ['mixed-in'], server: 'remote' });
+  // Keep all Clash modes discoverable even after the empty-list rewrite.
+  // These terminal routes exactly match final; earlier process/site/mixed
+  // decisions retain precedence. No fake "never-matching" domains are needed.
+  const finalOutbound = reverseApps ? SELECTOR_TAG : 'direct';
+  rules.push(...ROUTING_MODES.map(clash_mode => ({ clash_mode, outbound: finalOutbound })));
 
   // rule_set 在 route 下统一声明；DNS 规则引用了 geosite-cn，所以即便路由规则没用它也要声明
   const ruleSet = [];
@@ -236,7 +241,7 @@ export function buildTunPerAppConfig(nodes, opts = {}) {
       default_domain_resolver: 'local',
       rules,
       // 默认其余直连；反向时名单内已排除，其余进入代理分流
-      final: reverseApps ? SELECTOR_TAG : 'direct',
+      final: finalOutbound,
     },
   };
   if (ruleSet.length) config.route.rule_set = ruleSet;

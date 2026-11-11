@@ -26,7 +26,9 @@ swift test --package-path tools/proxy-preferences # 仅内存 PreferencesStore �
 
 第二批加入热切确认、Store/订阅事务、typed schema、受限 RE2/IP 校验、Swift effective 状态与严格 macOS 恢复回归。Linux 无 Swift/Xcode或指定内核；当前批次的 Swift、固定内核与新增回环流量门禁必须以同一提交的实际 CI 日志为准。真实系统代理恢复、TUN、UI 交互、macOS 13 运行与正式分发均未验证。下方历史记录不构成本批验证证据。
 
-第二批本地检查点：Linux / Node 24.22.1，`npm test` 508 项，497 通过、0 失败、11 显式跳过（真实内核10项、Linux capability1项）。58项原生Swift及10项helper测试在此环境没有执行。未提供SING_BOX时，固定内核与显式回环门禁均未验证，不得将这些缺项写成通过。
+第二批本地检查点：Linux / Node 24.22.1，模式注册补丁后 `npm test` 528 项，517 通过、0 失败、11 显式跳过（真实内核10项、Linux capability1项）。58项原生Swift及10项helper测试在此环境没有执行。未提供SING_BOX时，固定内核与显式回环门禁均未验证，不得将这些缺项写成通过。
+
+第二批 `9dc3833` 的[首轮CI](https://github.com/yingshu0218/jms/actions/runs/43064692834)不是通过结果：Intel 已实际通过58项Swift、10项helper、Node及配置/规则检查，但真实回环矩阵有3个子测试失败，arm64取消、未验证。已据官方源码定位为部分配置缺少 `rule` 或其他模式注册（不支持的模式PATCH仍回204），不能用测试sleep掩盖。新增90组配置模式列表矩阵及限时确认回归，真实内核门禁先断言 `mode-list` 三档齐全，再保留实际流量矩阵。修后仍须新提交完整CI，不能沿用旧提交的局部门禁。
 
 ### macOS 恢复事务的两个入口
 

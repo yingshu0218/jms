@@ -5,11 +5,18 @@
 //
 // 端点（Clash 兼容）： /version · /proxies · /proxies/{name}/delay · PUT /proxies/{name} · /connections
 
+const canonicalMode = value => typeof value === 'string' && ['rule', 'global', 'direct'].includes(value.trim().toLowerCase()) ? value.trim().toLowerCase() : null;
+const unconfirmed = cause => Object.assign(new Error('内核未在截止时间内确认目标状态，切换结果未知'), { code: 'CLASH_UNCONFIRMED', cause });
+
 export class ClashApi {
-  constructor(baseUrl = 'http://127.0.0.1:9090', { secret = '', timeoutMs = 8000 } = {}) {
+  constructor(baseUrl = 'http://127.0.0.1:9090', { secret = '', timeoutMs = 8000,
+    confirmationTimeoutMs = Math.min(5000, timeoutMs), confirmationIntervalMs = 50,
+    fetchImpl = fetch, assertCurrent = () => {} } = {}) {
     this.base = baseUrl.replace(/\/+$/, '');
     this.secret = secret;
     this.timeoutMs = timeoutMs;
+    if (!Number.isFinite(confirmationTimeoutMs) || confirmationTimeoutMs <= 0 || !Number.isFinite(confirmationIntervalMs) || confirmationIntervalMs < 0) throw new Error('内核确认截止参数无效');
+    Object.assign(this, { confirmationTimeoutMs, confirmationIntervalMs, fetchImpl, assertCurrent });
   }
 
   #headers() {
@@ -18,33 +25,66 @@ export class ClashApi {
 
   async #req(path, { method = 'GET', body, timeoutMs = this.timeoutMs } = {}) {
     const ac = new AbortController();
-    const t = setTimeout(() => ac.abort(new Error('内核 API 超时')), timeoutMs);
+    const deadline = performance.now() + timeoutMs;
+    const timeout = new Error('内核 API 超时');
+    let timer;
+    const expired = new Promise((_, reject) => { timer = setTimeout(() => { ac.abort(timeout); reject(timeout); }, timeoutMs); });
     try {
-      const res = await fetch(`${this.base}${path}`, {
-        method,
-        redirect: 'error',
-        headers: {
-          ...this.#headers(),
-          ...(body ? { 'Content-Type': 'application/json' } : {}),
-        },
-        body: body ? JSON.stringify(body) : undefined,
-        signal: ac.signal,
-      });
-      if (!res.ok) throw new Error(`内核 API ${method} ${path} → HTTP ${res.status}`);
-      // PUT 切换节点可能返回空体
-      const text = await res.text();
-      return text ? JSON.parse(text) : null;
+      return await Promise.race([(async () => {
+        // Repeated confirmation requests must not disclose an old capability to a
+        // replacement listener after this exact owned PID/session has exited.
+        this.assertCurrent();
+        if (performance.now() >= deadline) throw timeout;
+        const res = await this.fetchImpl(`${this.base}${path}`, {
+          method,
+          redirect: 'error',
+          headers: {
+            ...this.#headers(),
+            ...(body ? { 'Content-Type': 'application/json' } : {}),
+          },
+          body: body ? JSON.stringify(body) : undefined,
+          signal: ac.signal,
+        });
+        if (ac.signal.aborted || performance.now() >= deadline) { try { Promise.resolve(res.body?.cancel()).catch(() => {}); } catch {} throw timeout; }
+        if (!res.ok) throw new Error(`内核 API ${method} ${path} → HTTP ${res.status}`);
+        // PUT 切换节点可能返回空体
+        const text = await res.text();
+        if (ac.signal.aborted || performance.now() >= deadline) throw timeout;
+        this.assertCurrent();
+        return text ? JSON.parse(text) : null;
+      })(), expired]);
     } finally {
-      clearTimeout(t);
+      clearTimeout(timer);
     }
+  }
+
+  async #confirm(deadline, read, matches) {
+    for (;;) {
+      const remaining = deadline - performance.now();
+      if (remaining <= 0) throw unconfirmed();
+      this.assertCurrent();
+      const value = await read(remaining);
+      this.assertCurrent();
+      if (performance.now() >= deadline) throw unconfirmed();
+      const confirmed = matches(value);
+      if (performance.now() >= deadline) throw unconfirmed();
+      if (confirmed) return;
+      await new Promise(resolve => setTimeout(resolve, Math.min(this.confirmationIntervalMs, deadline - performance.now())));
+    }
+  }
+  #confirmationError(error) {
+    if (['STALE_SESSION', 'CLASH_UNSUPPORTED_MODE', 'CLASH_UNCONFIRMED'].includes(error?.code)) return error;
+    return unconfirmed(error);
   }
 
   async verifyOwnership() {
     const wrongSecret = (await import('node:crypto')).randomBytes(32).toString('hex');
-    const rejected = await fetch(`${this.base}/version`, {
+    this.assertCurrent();
+    const rejected = await this.fetchImpl(`${this.base}/version`, {
       headers: { Authorization: `Bearer ${wrongSecret}` },
       redirect: 'error', signal: AbortSignal.timeout(3000),
     });
+    this.assertCurrent();
     await rejected.body?.cancel();
     if (rejected.status !== 401) throw new Error('内核 API 未拒绝错误认证，不能确认本次内核身份');
     return this.version();
@@ -76,12 +116,20 @@ export class ClashApi {
    * 这是把节点做成 selector 出站带来的直接好处。
    */
   async select(selectorName, targetName) {
-    await this.#req(`/proxies/${encodeURIComponent(selectorName)}`, {
-      method: 'PUT',
-      body: { name: targetName },
-      timeoutMs: 5000,
-    });
-    return true;
+    const deadline = performance.now() + this.confirmationTimeoutMs;
+    try {
+      await this.#req(`/proxies/${encodeURIComponent(selectorName)}`, {
+        method: 'PUT',
+        body: { name: targetName },
+        timeoutMs: Math.max(1, deadline - performance.now()),
+      });
+      await this.#confirm(deadline, remaining => this.#req('/proxies', { timeoutMs: remaining }), data => {
+        const actual = data?.proxies?.[selectorName]?.now;
+        if (typeof actual !== 'string') throw unconfirmed();
+        return actual === targetName;
+      });
+      return true;
+    } catch (error) { throw this.#confirmationError(error); }
   }
 
   /**
@@ -92,6 +140,11 @@ export class ClashApi {
     const d = await this.#req('/configs');
     return d?.mode ?? null;
   }
+  async getModeList() {
+    const d = await this.#req('/configs');
+    if (!Array.isArray(d?.['mode-list']) || !d['mode-list'].every(value => canonicalMode(value))) throw unconfirmed();
+    return [...new Set(d['mode-list'].map(canonicalMode))];
+  }
 
   /**
    * 热切换路由模式 —— **不需要重启内核**。
@@ -99,8 +152,18 @@ export class ClashApi {
    * 实际出站选择都会随之改变（配合配置里的 clash_mode 规则）。
    */
   async setMode(mode) {
-    await this.#req('/configs', { method: 'PATCH', body: { mode }, timeoutMs: 5000 });
-    return mode;
+    const target = canonicalMode(mode), deadline = performance.now() + this.confirmationTimeoutMs;
+    if (!target) throw unconfirmed();
+    try {
+      await this.#req('/configs', { method: 'PATCH', body: { mode: target }, timeoutMs: Math.max(1, deadline - performance.now()) });
+      await this.#confirm(deadline, remaining => this.#req('/configs', { timeoutMs: remaining }), data => {
+        const actual = canonicalMode(data?.mode), modes = data?.['mode-list'];
+        if (!actual || !Array.isArray(modes) || !modes.every(value => canonicalMode(value))) throw unconfirmed();
+        if (!modes.some(value => canonicalMode(value) === target)) throw Object.assign(new Error('当前内核配置未注册目标路由模式，未确认切换'), {code:'CLASH_UNSUPPORTED_MODE'});
+        return actual === target;
+      });
+      return target;
+    } catch (error) { throw this.#confirmationError(error); }
   }
 
   /** 读取 selector 当前指向 */

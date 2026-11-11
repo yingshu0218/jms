@@ -50,8 +50,9 @@ async function startCore(config, ownedPorts) {
     assert.equal(inbound.listen, '127.0.0.1');
   }
   await writeFile(configPath, JSON.stringify(config), { mode: 0o600 });
-  const api = new ClashApi(`http://127.0.0.1:${apiPort}`, { secret, timeoutMs: 3000 });
   let core;
+  const api = new ClashApi(`http://127.0.0.1:${apiPort}`, { secret, timeoutMs: 3000,
+    assertCurrent: () => { if (!core?.isRunning()) throw Object.assign(new Error('fixture core exited'), {code:'STALE_SESSION'}); } });
   core = new CoreSupervisor({ binaryPath: binary, configPath, workDir: dir,
     logFile: join(dir, 'core.log'), maxRestarts: 0, readyTimeoutMs: 10000,
     readyCheck: async () => {
@@ -81,6 +82,9 @@ async function startCore(config, ownedPorts) {
 async function mode(api, value) {
   await api.setMode(value);
   assert.equal(String(await api.getMode()).toLowerCase(), value);
+}
+async function registeredModes(api) {
+  assert.deepEqual((await api.getModeList()).sort(), [...ROUTING_MODES].sort(), 'fixed core must register all supported modes, not silently ignore PATCH');
 }
 async function selection(api, value) {
   await api.select('proxy', value);
@@ -140,6 +144,7 @@ test('fixed core: loopback-only mode traffic and TUN diagnostic boundary', { tim
       const opts = await configOptions(cold);
       const instance = await startCore(buildConfig(nodes, opts), [opts.port]);
       try {
+        await registeredModes(instance.api);
         assert.equal(String(await instance.api.getMode()).toLowerCase(), cold);
         await selection(instance.api, 'local-good');
         for (const from of ROUTING_MODES) for (const to of ROUTING_MODES) {
@@ -169,6 +174,7 @@ test('fixed core: loopback-only mode traffic and TUN diagnostic boundary', { tim
         config.inbounds = config.inbounds.filter(i => i.type !== 'tun');
         const instance = await startCore(config, [opts.port]);
         try {
+          await registeredModes(instance.api);
           for (const current of ROUTING_MODES) {
             await mode(instance.api, current);
             await selection(instance.api, 'local-dead');
