@@ -4,6 +4,11 @@ import { execFile } from 'node:child_process';
 import { isDeepStrictEqual } from 'node:util';
 import { isAbsolute } from 'node:path';
 const failure = () => Object.assign(new Error('系统代理事务未获完整验证；恢复日志已保留，请检查原设置'), {code:'RECOVERY_REQUIRED'});
+// Only a verified pre-write denial may receive this actionable classification.
+// This describes this operation, not the state left by any earlier transaction.
+const responseFailure = result => result?.ok === false && result.code === 'AUTHORIZATION_REQUIRED' && result.committed === false
+  ? Object.assign(new Error('系统代理授权尚未接入；本次操作未写入系统设置。若有待恢复记录，请保留并检查原设置。'), {code:'SYS_PROXY_AUTHORIZATION_REQUIRED'})
+  : failure();
 export function validateRawSnapshot(value) {
   if (!value || value.schema !== 3 || !Array.isArray(value.services) || !value.services.length || value.services.length > 128) throw failure();
   const ids=new Set();
@@ -29,8 +34,8 @@ export function createPreferencesInvoker(helperPath) {
 }
 export function createDarwinPreferencesAdapter({invoke=createPreferencesInvoker(process.env.JMS_PROXY_HELPER),readPublic}={}) {
   let restorationProof=null;
-  const call=async request=>{let result;try{result=await invoke(request);}catch{throw failure();}if(!result || result.ok!==true) throw failure();return result;};
-  const snapshotRaw=async()=>validateRawSnapshot((await call({operation:'snapshot'})).snapshot);
+  const call=async(request,allowAuthorization=true)=>{let result;try{result=await invoke(request);}catch{throw failure();}if(!result || result.ok!==true) throw allowAuthorization ? responseFailure(result) : failure();return result;};
+  const snapshotRaw=async(allowAuthorization=true)=>validateRawSnapshot((await call({operation:'snapshot'},allowAuthorization)).snapshot);
   const validateEntry=entry=>{
     if(!entry || entry.version!==2 || entry.platform!=='darwin' || entry.darwin?.schema!==3) throw failure();
     validateRawSnapshot(entry.previousBase);validateRawSnapshot(entry.darwin.targetBase);
@@ -50,9 +55,9 @@ export function createDarwinPreferencesAdapter({invoke=createPreferencesInvoker(
     try{result=await invoke({operation:'compareAndSet',expected:current,desired});}catch{throw failure();}
     if(!result || result.ok!==true || result.committed!==true || result.applied!==true || !isDeepStrictEqual(result.snapshot,desired)) {
       journal.updateDarwin({...entry.darwin,intent:restore?'restore':'apply',outcome:'unverified',committed:result?.committed===true?true:result?.committed===false?false:'unknown',applied:result?.applied===true});
-      throw failure();
+      throw responseFailure(result);
     }
-    if(!isDeepStrictEqual(await snapshotRaw(),desired)) throw failure();
+    if(!isDeepStrictEqual(await snapshotRaw(false),desired)) throw failure();
     journal.updateDarwin({...entry.darwin,intent:restore?'restore':'apply',outcome:'verified',committed:true,applied:true});
     if(restore) restorationProof=structuredClone(desired);
   };
@@ -68,6 +73,6 @@ export function createDarwinPreferencesAdapter({invoke=createPreferencesInvoker(
     },
     async apply(_target,{journal}={}){await transact(journal,false);},
     async restore(base,{journal}={}){const entry=validateEntry(journal?.read());if(!isDeepStrictEqual(base,entry.previousBase))throw failure();await transact(journal,true);},
-    async verifyRestored(entry){validateEntry(entry);return isDeepStrictEqual(restorationProof,entry.previousBase)&&isDeepStrictEqual(await snapshotRaw(),entry.previousBase);}
+    async verifyRestored(entry){validateEntry(entry);return isDeepStrictEqual(restorationProof,entry.previousBase)&&isDeepStrictEqual(await snapshotRaw(false),entry.previousBase);}
   };
 }

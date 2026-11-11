@@ -10,6 +10,25 @@ final class RejectEngineRedirects: NSObject, URLSessionTaskDelegate {
     }
 }
 
+/// Local engine control must not inherit system proxy routing, cookies or credentials.
+/// This only configures these URLSession instances; it does not alter macOS settings.
+enum EngineControlSession {
+    static func make(protocolClasses: [AnyClass]? = nil) -> URLSession {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.connectionProxyDictionary = [:]
+        configuration.urlCredentialStorage = nil
+        configuration.httpCookieStorage = nil
+        configuration.httpShouldSetCookies = false
+        configuration.httpAdditionalHeaders = nil
+        configuration.protocolClasses = protocolClasses
+        return URLSession(configuration: configuration, delegate: RejectEngineRedirects(), delegateQueue: nil)
+    }
+    static func probe(for session: URLSession) -> URLSession {
+        // Test transports are the sole inherited property. No headers/proxies/cookies.
+        make(protocolClasses: session.configuration.protocolClasses)
+    }
+}
+
 struct EngineIdentity: Decodable {
     let name: String
     let protocolVersion: Int
@@ -19,7 +38,7 @@ struct EngineIdentity: Decodable {
 
 struct EngineClient {
     var timeout: TimeInterval = 90
-    var session: URLSession = URLSession(configuration: .ephemeral, delegate: RejectEngineRedirects(), delegateQueue: nil)
+    var session: URLSession = EngineControlSession.make()
     var baseURL = URL(string: "http://127.0.0.1:7788")!
     var lease = EngineLease()
     var token: String { lease.token }
@@ -36,12 +55,7 @@ struct EngineClient {
         try validateEndpoint()
         var request = URLRequest(url: baseURL.appendingPathComponent("api/identity"))
         request.timeoutInterval = timeout
-        let config = URLSessionConfiguration.ephemeral
-        config.urlCredentialStorage = nil
-        config.httpCookieStorage = nil
-        // Preserve test transports only, never authenticated session headers.
-        config.protocolClasses = session.configuration.protocolClasses
-        let transport = URLSession(configuration: config, delegate: RejectEngineRedirects(), delegateQueue: nil)
+        let transport = EngineControlSession.probe(for: session)
         defer { transport.invalidateAndCancel() }
         let (_, response) = try await send(request, using: transport)
         guard response is HTTPURLResponse else { throw APIError(message: "端口响应无效，已拒绝启动") }

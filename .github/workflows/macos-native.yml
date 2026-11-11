@@ -144,6 +144,16 @@ jobs:
         env:
           EXPECTED_ARCH: ${{ matrix.arch }}
         run: bash app/tools/validate-native-bundle.sh
+      - name: Native real IPC smoke (isolated owned child only)
+        timeout-minutes: 3
+        env:
+          JMS_NATIVE_IPC_SMOKE: '1'
+        run: |
+          set -o pipefail
+          export JMS_NATIVE_IPC_BUNDLE="$PWD/app/dist/JMS Client Candidate.app"
+          swift test --package-path app/macos --filter NativeIPCSmokeTests/testBundledIsolatedEngineLifecycle 2>&1 | tee app/build/ci/native-ipc-smoke.log
+          grep -Eq 'Executed 1 test, with 0 failures' app/build/ci/native-ipc-smoke.log
+          if grep -Eiq 'test.*skipped|skipped.*test' app/build/ci/native-ipc-smoke.log; then exit 1; fi
       - name: Archive Candidate only (not a release)
         env:
           ARCH: ${{ matrix.arch }}

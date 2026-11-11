@@ -30,11 +30,28 @@ swift test --package-path tools/proxy-preferences # 仅内存 PreferencesStore �
 
 第二批 `9dc3833` 的[首轮CI](https://github.com/yingshu0218/jms/actions/runs/43064692834)不是通过结果：Intel 已实际通过58项Swift、10项helper、Node及配置/规则检查，但真实回环矩阵有3个子测试失败，arm64取消、未验证。已据官方源码定位为部分配置缺少 `rule` 或其他模式注册（不支持的模式PATCH仍回204），不能用测试sleep掩盖。新增90组配置模式列表矩阵及限时确认回归，真实内核门禁先断言 `mode-list` 三档齐全，再保留实际流量矩阵。修后仍须新提交完整CI，不能沿用旧提交的局部门禁。
 
+修后的 `669602b` 已在[分支CI](https://github.com/yingshu0218/jms/actions/runs/43068486820)及[同SHA的main CI](https://github.com/yingshu0218/jms/actions/runs/43070600022)实际通过：两架构各58项Swift、10项helper，Node528项中517通过/11跳过，27配置及16正/10负规则检查、8项真实SS回环0跳过、Candidate架构/最低版本/签名与打包。它不证明真实系统代理、TUN、GUI或macOS13运行。
+
+### 第三批：原生控制通道与恢复边界
+
+本地 Linux 检查点：Node549项，538通过、0失败、11跳过。普通Native63项、helper14项及显式IPC smoke 1项在本地没有Swift编译/执行证据，必须看本批新SHA的CI，不沿用669602b结果。
+
+在根目录、已验证的隔离Candidate构建后，显式运行：
+```bash
+JMS_NATIVE_IPC_SMOKE=1 JMS_NATIVE_IPC_BUNDLE="$PWD/app/dist/JMS Client Candidate.app" \
+  swift test --package-path app/macos --filter NativeIPCSmokeTests/testBundledIsolatedEngineLifecycle
+```
+普通Swift测试不编入该opt-in target，缺配置不能记为smoke通过。CI要求实际执行1项、0失败、0跳过。该测试使用源码EngineRuntime/EngineClient与随包SEA，非打包JMSNative主程序/GUI：真实lsof/身份/认证state与SSE握手、设置读回、占端口无凭据拒绝、两次自有启动/退出与令牌轮换。仅临时目录和回环HTTP；不运行helper/core、不使用订阅、不改系统代理/TUN。临时假正式目录哨兵必须逐字不变，状态/日志不进入产物。控制通道URLSession显式使用非nil空proxy字典并禁止cookie/凭据存储，不继承系统代理，未修改系统设置。
+
 ### macOS 恢复事务的两个入口
 
 原生包新增不提权的 `JMSProxyPreferences` helper，使用固定服务 UUID 路径、`SCPreferencesLock`、全服务 compare-and-set、一次 Commit/Apply 与持久状态读回。原始 Proxies plist 区分不存在、空字典和已停用的旧地址，私有 IPC 与0600 journal不输出原始字典。Swift helper 测试只注入内存存储，Node 只注入 fake IPC；绝不将 CLI 的 compareAndSet 当作测试运行。
 
 缺少完整服务身份、可识别的鉴权或不支持的字典键时拒绝接管，不读 Keychain、不装 setuid/daemon。仅存在于Keychain的鉴权能否被raw字典充分识别尚未证明，不能声称覆盖全部鉴权形态。没有随包 helper 的旧源码入口仍采用严格 networksetup 事务，无法无损恢复空旧host/port时拒绝。旧schema journal不自动猜测转换。这些限制与真实 Mac 非root权限/Apply 行为必须单独验收，源码与 mock 通过不代表系统代理可用性通过。
+
+权限门禁已由Apple官方源码明确：`SCPreferencesCreate`无Authorization引用，非root会在Lock遇AccessError；普通管理员正式接管尚缺授权实现，不是“可能权限不足”。确定的前置拒绝保留`SYS_PROXY_AUTHORIZATION_REQUIRED`，不误开TUN面板、不静默sudo/授权；提交后读回失败仍是恢复待处理，不能说未写入。
+
+`SCPreferencesPath*`会跟随`__LINK__`，因此helper改为从非path的GetValue验证原始树，拒root/service/identity/Proxies链接；仅允许同锁完整读回验证的UUID写入，sync/unlock清除写门。完整的旧outer-v2/base-schema2/darwin-schema1事务只在restore/heal精确分流给旧严格适配器，并由同一个适配器完成restore+verify后才清journal。残缺/混schema拒绝；新apply或raw失败绝不改走legacy，不迁移覆盖恢复证据。旧命令式恢复仍未具备锁内CAS的实机证明。
 
 
 ## 接手开发基线（2026-10-20）

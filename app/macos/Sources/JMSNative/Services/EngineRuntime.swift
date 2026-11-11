@@ -11,12 +11,19 @@ import AppKit
     var instanceId: String { client.lease.instanceId }
     var onTermination: (() -> Void)?
     private let resourcesDirectory: URL?
+    private let applicationSupportDirectory: URL
+    let isolatedLogDirectory: URL
+    func stateDirectoryURL() throws -> URL { try configuration.stateDirectory(applicationSupport: applicationSupportDirectory) }
     private var starting = false
     private let listenerChecker: (Int32, Int) async throws -> Bool
     init(client: EngineClient? = nil, resourcesDirectory: URL? = Bundle.main.resourceURL,
          configuration: RuntimeConfiguration = RuntimeConfiguration(),
          exitSafety: EngineExitSafety = EngineExitSafety(),
+         applicationSupportDirectory: URL = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0],
+         isolatedLogDirectory: URL = FileManager.default.temporaryDirectory,
          listenerChecker: @escaping (Int32, Int) async throws -> Bool = { pid, port in try await EngineListenerOwnership.check(pid: pid, port: port) }) {
+        self.applicationSupportDirectory = applicationSupportDirectory
+        self.isolatedLogDirectory = isolatedLogDirectory
         self.exitSafety = exitSafety
         self.listenerChecker = listenerChecker
         self.configuration = configuration
@@ -73,12 +80,12 @@ import AppKit
         let proxyHelper = resources.appendingPathComponent("engine/JMSProxyPreferences")
         guard FileManager.default.isExecutableFile(atPath: proxyHelper.path) else { throw APIError(message: "随包系统代理恢复工具缺失，请重新构建应用") }
         guard FileManager.default.isExecutableFile(atPath: engine.path), FileManager.default.isExecutableFile(atPath: core.path) else { throw APIError(message: "随包引擎或 sing-box 缺失，请重新构建应用") }
-        let dir = try configuration.stateDirectory(applicationSupport: FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0])
+        let dir = try stateDirectoryURL()
         // The isolated Node entry owns directory creation, lock and marker checks.
         // Do not create even a log file there before its empty-directory check.
         let logfile: URL
         if configuration.isolated {
-            logfile = FileManager.default.temporaryDirectory.appendingPathComponent("jms-candidate-\(UUID().uuidString).log")
+            logfile = isolatedLogDirectory.appendingPathComponent("jms-candidate-\(UUID().uuidString).log")
         } else {
             try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
             logfile = dir.appendingPathComponent("native-engine.log")
@@ -92,7 +99,7 @@ import AppKit
         let lease = client.lease
         let credentials = lease.begin(isAlive: { [weak p] in p?.isRunning == true })
         // Never reuse an invalidated transport from an earlier launch.
-        client.session = URLSession(configuration: .ephemeral, delegate: RejectEngineRedirects(), delegateQueue: nil)
+        client.session = EngineControlSession.make()
         let transport = client.session
         p.terminationHandler = { [weak self] _ in
             lease.revoke(instanceId: credentials.instanceId)

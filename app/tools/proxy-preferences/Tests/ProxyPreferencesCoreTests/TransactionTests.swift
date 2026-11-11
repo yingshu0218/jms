@@ -1,5 +1,6 @@
 import XCTest
 import CoreFoundation
+import SystemConfiguration
 @testable import ProxyPreferencesCore
 
 final class MemoryStore: PreferencesStore {
@@ -8,7 +9,8 @@ final class MemoryStore: PreferencesStore {
     var writes = 0, commits = 0, applies = 0
     var failWrite = false, failCommit = false, failApply = false, corruptReadback = false
     init(_ snapshot: Snapshot) { current = snapshot; staged = snapshot }
-    func lock() throws {}
+    var lockFailure: Failure?
+    func lock() throws { if let lockFailure { throw lockFailure } }
     func unlock() {}
     func synchronize() { staged = current }
     func read() throws -> Snapshot {
@@ -27,6 +29,36 @@ final class TransactionTests: XCTestCase {
     let id = "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE"
     func snapshot(_ dictionary: [String: Any]?) throws -> Snapshot {
         Snapshot(services: [Service(id: id, name: "Wi-Fi", device: "en0", proxies: try RawProxies(dictionary))])
+    }
+    func testAccessDenialIsDistinctFromOtherLockFailures() {
+        XCTAssertEqual(SystemPreferencesStore.lockFailure(status: Int32(kSCStatusAccessError)).code, .authorizationRequired)
+        for status in [kSCStatusFailed, kSCStatusPrefsBusy] {
+            XCTAssertEqual(SystemPreferencesStore.lockFailure(status: Int32(status)).code, .conflict)
+        }
+    }
+    func testAuthorizationDenialBeforeSnapshotPrepareAndCASNeverWrites() throws {
+        for operation in 0..<3 {
+            let original = try snapshot(nil)
+            let store = MemoryStore(original)
+            store.lockFailure = Failure(.authorizationRequired, .no)
+            let transaction = Transaction(store: store)
+            XCTAssertThrowsError(try {
+                switch operation {
+                case 0: _ = try transaction.snapshot()
+                case 1: _ = try transaction.prepare(Target(host: "127.0.0.1", port: 2080, bypass: []))
+                default: _ = try transaction.compareAndSet(expected: original, desired: original)
+                }
+            }()) { error in
+                XCTAssertEqual((error as? Failure)?.code, .authorizationRequired)
+                XCTAssertEqual((error as? Failure)?.committed, .no)
+            }
+            XCTAssertEqual(store.writes, 0); XCTAssertEqual(store.commits, 0); XCTAssertEqual(store.applies, 0)
+            XCTAssertTrue(try store.current.same(as: original))
+        }
+        let data = try JSONEncoder().encode(Failure(.authorizationRequired, .no))
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual(object["code"] as? String, "AUTHORIZATION_REQUIRED")
+        XCTAssertEqual(object["committed"] as? Bool, false)
     }
     func testStableBinaryPlistRoundTripAndDictionaryOrder() throws {
         var a: [String: Any] = [:], b: [String: Any] = [:]
@@ -128,4 +160,48 @@ final class TransactionTests: XCTestCase {
         _ = try Transaction(store: store).compareAndSet(expected: target, desired: original)
         XCTAssertTrue(try store.current.same(as: original))
     }
+}
+
+final class RawTreeBoundaryTests: XCTestCase {
+    private let id = "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE"
+    private func tree() -> [String: Any] {
+        [id: ["UserDefinedName": "Wi-Fi", "Interface": ["DeviceName": "en0"], "Proxies": ["HTTPEnable": 0]]]
+    }
+    func testRawTreeWithoutAliasesRetainsSnapshot() throws {
+        let snapshot = try SystemPreferencesStore.validateRawTree(tree())
+        XCTAssertEqual(snapshot.services.count, 1)
+        XCTAssertEqual(snapshot.services.first?.id, id)
+    }
+    func testRawAliasesAreRejectedBeforeAnyTransactionWrite() throws {
+        for location in ["root", "service", "Interface", "Proxies"] {
+            var raw = tree()
+            if location == "root" { raw["__LINK__"] = "/OtherServices" }
+            else {
+                var service = raw[id] as! [String: Any]
+                if location == "service" { service["__LINK__"] = "/OtherServices/another" }
+                else {
+                    var child = service[location] as! [String: Any]
+                    child["__LINK__"] = "/OtherServices/another/\(location)"
+                    service[location] = child
+                }
+                raw[id] = service
+            }
+            let store = RawTreeStore(raw: raw)
+            let expected = try SystemPreferencesStore.validateRawTree(tree())
+            XCTAssertThrowsError(try Transaction(store: store).compareAndSet(expected: expected, desired: expected))
+            XCTAssertEqual(store.writes, 0); XCTAssertEqual(store.commits, 0); XCTAssertEqual(store.applies, 0)
+        }
+    }
+}
+private final class RawTreeStore: PreferencesStore {
+    let raw: [String: Any]
+    var writes = 0, commits = 0, applies = 0
+    init(raw: [String: Any]) { self.raw = raw }
+    func lock() throws {}
+    func unlock() {}
+    func synchronize() {}
+    func read() throws -> Snapshot { try SystemPreferencesStore.validateRawTree(raw) }
+    func write(id: String, proxies: RawProxies) throws { writes += 1 }
+    func commit() -> Bool { commits += 1; return true }
+    func apply() -> Bool { applies += 1; return true }
 }

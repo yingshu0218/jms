@@ -409,6 +409,16 @@ function afterCommand(base, step) {
   return [next];
 }
 
+export function validateDarwinJournal(entry) {
+  if (entry?.version !== 2 || entry.platform !== 'darwin' || entry.darwin?.schema !== 1 || entry.darwin.originalBase !== undefined || !Array.isArray(entry.darwin.states) || !entry.darwin.states.length) throw darwinError('恢复日志版本或平台不匹配，未修改设置');
+  validateDarwinBase(entry.previousBase, { restorable: true });
+  validateDarwinBase(entry.darwin.targetBase, { restorable: true });
+  for (const state of entry.darwin.states) validateDarwinBase(state, { restorable: true });
+  const identity = b => b.services.map(({ id, name, device }) => ({ id, name, device })).sort((a, b) => a.id.localeCompare(b.id));
+  for (const state of [entry.darwin.targetBase, ...entry.darwin.states]) if (!isDeepStrictEqual(identity(state), identity(entry.previousBase))) throw darwinError('恢复日志服务身份不一致');
+  if (!entry.darwin.states.some(s => equalBase(s, entry.previousBase))) throw darwinError('恢复日志缺少原始状态');
+}
+
 export function createDarwinAdapter({ execute = sh } = {}) {
   const command = (cmd, args, options = {}) => execute(cmd, args, { ...options, env: { ...process.env, LC_ALL: 'C', LANG: 'C' } });
   const ns = args => command('networksetup', args);
@@ -479,17 +489,8 @@ export function createDarwinAdapter({ execute = sh } = {}) {
       port: proxy.enabled ? proxy.port : null, bypass: active.bypass.length ? active.bypass : null,
       service: active.name, base };
   }
-  function validateEntry(entry) {
-    if (entry?.version !== 2 || entry.platform !== 'darwin' || entry.darwin?.schema !== 1 || !Array.isArray(entry.darwin.states) || !entry.darwin.states.length) throw darwinError('恢复日志版本或平台不匹配，未修改设置');
-    validateDarwinBase(entry.previousBase, { restorable: true });
-    validateDarwinBase(entry.darwin.targetBase, { restorable: true });
-    for (const state of entry.darwin.states) validateDarwinBase(state, { restorable: true });
-    const identity = b => b.services.map(({ id, name, device }) => ({ id, name, device })).sort((a, b) => a.id.localeCompare(b.id));
-    for (const state of [entry.darwin.targetBase, ...entry.darwin.states]) if (!isDeepStrictEqual(identity(state), identity(entry.previousBase))) throw darwinError('恢复日志服务身份不一致');
-    if (!entry.darwin.states.some(s => equalBase(s, entry.previousBase))) throw darwinError('恢复日志缺少原始状态');
-  }
   async function checkedCurrent(entry) {
-    validateEntry(entry);
+    validateDarwinJournal(entry);
     const current = (await snapshot()).base;
     if (!entry.darwin.states.some(state => equalBase(state, current))) throw darwinError('系统代理存在外部改动或网络服务变化，已保留恢复日志且未覆盖');
     return current;
@@ -533,11 +534,11 @@ export function createDarwinAdapter({ execute = sh } = {}) {
       return { schema: 1, states: [clone(snap.base)], targetBase };
     },
     async apply(target, { journal } = {}) {
-      const entry = journal?.read(); validateEntry(entry);
+      const entry = journal?.read(); validateDarwinJournal(entry);
       await transact(planDarwin({ ...target, base: entry.previousBase }), entry.darwin.targetBase, journal);
     },
     async restore(base, { journal } = {}) {
-      const entry = journal?.read(); validateEntry(entry);
+      const entry = journal?.read(); validateDarwinJournal(entry);
       if (!equalBase(base, entry.previousBase)) throw darwinError('恢复目标与日志不符');
       await transact(planDarwin({ mode: 'restore', base }), base, journal);
     },
@@ -644,7 +645,12 @@ export function getAdapter(platform = process.platform) {
     case 'win32':
       return win32Adapter;
     case 'darwin':
-      return process.env.JMS_PROXY_HELPER ? createDarwinPreferencesAdapter({readPublic: () => darwinAdapter.read()}) : darwinAdapter;
+      if (!process.env.JMS_PROXY_HELPER) return darwinAdapter;
+      // New connections always use raw preferences. Legacy recovery is selected
+      // only by its complete persisted schema, never after a raw operation fails.
+      return Object.assign(createDarwinPreferencesAdapter({readPublic: () => darwinAdapter.read()}), {
+        legacyRecoveryAdapter: darwinAdapter,
+      });
     case 'linux':
       return linuxAdapter;
     default:

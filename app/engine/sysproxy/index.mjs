@@ -6,7 +6,7 @@
 //   ③ 启动时：发现日志残留 = 上次崩了 → 立刻还原
 
 import { ProxyJournal } from './journal.mjs';
-import { getAdapter, MockAdapter } from './adapters.mjs';
+import { getAdapter, MockAdapter, validateDarwinJournal } from './adapters.mjs';
 
 export { ProxyJournal, getAdapter, MockAdapter };
 
@@ -54,13 +54,28 @@ export async function enableProxy({ adapter, journal, host = '127.0.0.1', port, 
  * 在全服务冲突检查和逐项读回通过后才允许清除日志；不猜测旧设置。
  */
 function recoveryError(message) { return Object.assign(new Error(message), { code: 'RECOVERY_REQUIRED' }); }
+function darwinRecoveryAdapter(adapter, entry) {
+  const base = entry.previousBase, transaction = entry.darwin;
+  if (base?.schema === 2 && transaction?.schema === 1) {
+    // Complete old networksetup journals keep their original semantics. Do not
+    // reinterpret their snapshots as raw plists or migrate/overwrite evidence.
+    validateDarwinJournal(entry);
+    const selected = adapter.transactionVersion === 2 ? adapter : adapter.legacyRecoveryAdapter;
+    if (selected?.platform !== 'darwin' || selected.transactionVersion !== 2) throw recoveryError('缺少匹配的旧版恢复器，日志已保留');
+    return selected;
+  }
+  if (base?.schema === 3 && transaction?.schema === 3 && transaction.originalBase?.schema === 3 &&
+      transaction.targetBase?.schema === 3 && !Object.hasOwn(transaction, 'states') && adapter.transactionVersion === 3) return adapter;
+  throw recoveryError('Darwin恢复日志版本不完整或混合，未修改设置');
+}
 async function restoreTo(adapter, entry, journal) {
   if (!entry || entry.version !== 2 || entry.platform !== adapter.platform) throw recoveryError('恢复日志版本或平台不匹配，未修改设置');
   const base = entry.previousBase;
   if (adapter.platform === 'darwin') {
     if (![2, 3].includes(adapter.transactionVersion) || !base) throw recoveryError('Darwin恢复日志不完整，未修改设置');
-    await adapter.restore(base, { journal });
-    if (!await adapter.verifyRestored(journal.read())) throw recoveryError('系统代理恢复读回不一致，日志已保留');
+    const selected = darwinRecoveryAdapter(adapter, entry);
+    await selected.restore(base, { journal });
+    if (!await selected.verifyRestored(journal.read())) throw recoveryError('系统代理恢复读回不一致，日志已保留');
     return;
   }
   if (base && typeof adapter.restore === 'function') { await adapter.restore(base); return; }
