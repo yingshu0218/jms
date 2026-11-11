@@ -14,7 +14,7 @@ final class RequestTimeoutTests: XCTestCase {
         config.protocolClasses = [StalledProtocol.self]
         let session = URLSession(configuration: config)
         defer { session.invalidateAndCancel() }
-        let client = EngineClient(timeout: 0.05, session: session)
+        let client = EngineClient(timeout: 0.05, session: session, lease: authorizedTestLease())
         let started = Date()
         do { _ = try await client.request("api/state"); XCTFail("应超时") }
         catch { XCTAssertTrue(error.localizedDescription.contains("超时")) }

@@ -1,3 +1,4 @@
+import { authenticatedFetch as fetch, TEST_SERVER_AUTH } from './http-fixture.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
@@ -42,7 +43,7 @@ test('连接服务：停机空状态，拒绝无效关闭，不吞掉内核失�
 });
 test('连接 HTTP API：查询、单条及全部关闭，错误明确返回',async t=>{
  const {app,calls}=await setup(t);app.supervisor={isRunning:()=>true};
- const server=createAppServer({app,port:0});await once(server,'listening');t.after(()=>{server.closeAllConnections();server.close();});
+ const server=createAppServer({app,port:0,...TEST_SERVER_AUTH});await once(server,'listening');t.after(()=>{server.closeAllConnections();server.close();});
  const base=`http://127.0.0.1:${server.address().port}`;
  assert.equal((await (await fetch(base+'/api/connections')).json()).connections.length,1);
  const close=body=>fetch(base+'/api/connections/close',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});

@@ -1,5 +1,7 @@
 # 交接说明 —— 给接手开发的 agent
 
+> 2026-11-11 安全整改：当前入口与边界以 `app/TESTING.md` 顶部为准。`npm test` 为安全隔离单测；`verify.sh` 不再自动下载/启动内核。Candidate 独立身份/端口/目录并强制隔离，不能接管宿主网络；原生不复用外部引擎。下方历史中的“先跑预检/roundtrip”等建议会改真实代理，本轮禁止执行。Swift/真实内核与 macOS 验证尚未完成，不能据 Linux 单测接入真实订阅。
+
 > SwiftUI 更新：Mac 原生工程位于 `app/macos/`，根目录 `./script/build_and_run.sh` 构建并运行。
 > 当前已有可运行原生应用、独立随包引擎、规则文件面板和退出保护。Swift 测试 10 项通过；共享测试 182 通过、1 跳过。
 > 详细构建依赖与验证边界见 `app/macos/README.md` 和 `app/TESTING.md`，以下历史记录不代表当前全部状态。

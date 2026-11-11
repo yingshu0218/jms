@@ -3,3 +3,7 @@ Thumbs.db
 app/macos/.build/
 app/macos/.swiftpm/
 app/dist/
+
+# Per-instance runtime capabilities must never be committed.
+**/api-auth.json
+**/.jms-isolated.json

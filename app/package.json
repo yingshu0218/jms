@@ -5,7 +5,7 @@
   "type": "module",
   "description": "自研代理客户端 · 引擎（M2）：订阅管理 / 配置生成 / 内核守护 / 进程级分流 / 系统代理自愈",
   "scripts": {
-    "test": "node --test test/engine.test.mjs test/linkcheck.test.mjs test/modes.test.mjs test/rules.test.mjs test/sysproxy-adapters.test.mjs test/macos-sysproxy.test.mjs test/privilege.test.mjs test/tun-routing.test.mjs test/profiles.test.mjs test/connections.test.mjs test/ruleset-offline.test.mjs test/latency.test.mjs",
+    "test": "node tools/test-safe.mjs",
     "start": "node engine/server.mjs",
     "verify": "./verify.sh"
   },

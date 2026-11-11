@@ -1,7 +1,7 @@
 // HTTP 传输层 + 静态 UI
 //
 // 只监听回环地址：控制 API 能启停代理、改系统设置，绝不能暴露到局域网。
-// （沙箱/远程预览时用 --host 0.0.0.0 显式打开，并自行承担风险。）
+// 不提供对外网卡监听选项；原生/CLI均需本实例随机秘密。
 
 import { createServer } from 'node:http';
 import { readFileSync, existsSync } from 'node:fs';
@@ -9,15 +9,10 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isSea } from 'node:sea';
 
-import { AppService } from './app.mjs';
-import { acquireLock } from './lock.mjs';
+import { checkApiToken, requestAuthorized, requestSourceAllowed, API_PROTOCOL_VERSION } from './control-auth.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const UI_FILE = join(here, '..', 'ui', 'index.html');
-
-// 打包成桌面应用后前端由 Tauri 自己的协议提供，与引擎不同源，必须显式放行。
-// 只放行桌面壳这两个来源；服务本身也只监听回环地址，不是把 API 开给公网。
-const ALLOWED_ORIGINS = new Set(['tauri://localhost', 'http://tauri.localhost', 'https://tauri.localhost']);
 
 function json(res, code, body) {
   const payload = JSON.stringify(body);
@@ -45,8 +40,23 @@ async function body(req, limit = 256 * 1024) {
   }
 }
 
-export function createAppServer({ app, host = '127.0.0.1', port = 7788, uiFile = UI_FILE } = {}) {
+export function createAppServer({ app, host = '127.0.0.1', port = 7788, uiFile = UI_FILE, authToken, instanceId } = {}) {
+  checkApiToken(authToken);
+  if (!['127.0.0.1', '::1'].includes(host)) throw new Error('引擎仅允许监听回环地址');
+  if (typeof instanceId !== 'string' || !instanceId || instanceId.length > 128) throw new Error('引擎实例标识缺失');
   const clients = new Set();
+  const activeOperations = new Set();
+  let drainingRequest;
+  const drain = () => {
+    if (drainingRequest) return drainingRequest;
+    app.draining = true;
+    clearInterval(app.refreshTimer);
+    drainingRequest = (async () => {
+      try { await Promise.allSettled([...activeOperations]); return await app.shutdown(); }
+      finally { drainingRequest = null; }
+    })();
+    return drainingRequest;
+  };
 
   const broadcast = (event, data) => {
     const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
@@ -59,29 +69,24 @@ export function createAppServer({ app, host = '127.0.0.1', port = 7788, uiFile =
     }
   };
 
-  for (const evt of ['connected', 'disconnected', 'warn', 'healed', 'restarted', 'gaveup', 'subscription']) {
+  for (const evt of ['connected', 'disconnected', 'warn', 'healed', 'restarted', 'gaveup', 'subscription', 'operation-progress', 'routing-mode', 'selected']) {
     app.on(evt, (data) => broadcast(evt, data ?? null));
   }
   app.on('core-log', (line) => broadcast('core-log', line));
 
-  const server = createServer(async (req, res) => {
-    const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
-    const path = url.pathname;
-
-    // 跨源放行（打包后前端在 tauri:// 或 http://tauri.localhost 上）
-    const origin = req.headers.origin;
-    if (origin && ALLOWED_ORIGINS.has(origin)) {
-      res.setHeader('Access-Control-Allow-Origin', origin);
-      res.setHeader('Vary', 'Origin');
-      res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-    }
-    if (req.method === 'OPTIONS') {
-      res.writeHead(204);
-      return res.end();
-    }
-
+  const handle = async (req, res) => {
     try {
+      if (!requestSourceAllowed(req, server.address())) return json(res, 403, { error: '请求来源无效' });
+      const url = new URL(req.url, 'http://127.0.0.1');
+      const path = url.pathname;
+      // 所有控制数据（也包括只读状态、日志和 SSE）必须验证本次实例秘密。
+      if (path.startsWith('/api/') && !requestAuthorized(req, authToken)) return json(res, 401, { error: '需要本实例认证', code: 'UNAUTHORIZED' });
+      if (req.method === 'OPTIONS') return json(res, 405, { error: '不允许跨源控制' });
+      if (app.ready === false) return json(res, 503, { error: '引擎正在启动', code: 'STARTING' });
+      if (req.method === 'GET' && path === '/api/identity') {
+        return json(res, 200, { name: 'jms-engine', protocolVersion: API_PROTOCOL_VERSION, instanceId, isolated: app.isolated });
+      }
+
       // ── 静态 UI ──
       if (req.method === 'GET' && (path === '/' || path === '/index.html')) {
         if (!existsSync(uiFile)) return json(res, 500, { error: 'UI 文件缺失' });
@@ -139,7 +144,16 @@ export function createAppServer({ app, host = '127.0.0.1', port = 7788, uiFile =
 
       // ── 写操作 ──
       if (req.method !== 'POST') return json(res, 405, { error: '方法不允许' });
+      if (!/^application\/json(?:;|$)/i.test(req.headers['content-type'] || '')) return json(res, 415, { error: '需要 application/json' });
       const payload = await body(req);
+      if (path === '/api/shutdown') {
+        return json(res, 200, await drain());
+      }
+      if (path === '/api/resume') {
+        if (drainingRequest) throw new Error('引擎仍在等待已开始的操作完成');
+        return json(res, 200, app.resume());
+      }
+      if (path !== '/api/disconnect') app.assertMutable();
 
       switch (path) {
         case '/api/connections/close': return json(res, 200, await app.closeConnections(payload));
@@ -189,7 +203,7 @@ export function createAppServer({ app, host = '127.0.0.1', port = 7788, uiFile =
           return json(res, 200, out);
         }
         case '/api/settings': {
-          const out = await app.updateSettings(payload.settings || {});
+          const out = await app.updateSettings(payload.settings === undefined ? {} : payload.settings);
           return json(res, 200, { ok: true, settings: out });
         }
         default:
@@ -204,8 +218,20 @@ export function createAppServer({ app, host = '127.0.0.1', port = 7788, uiFile =
         ...(e.privilege ? { privilege: e.privilege } : {}),
       });
     }
+  };
+  const server = createServer((req, res) => {
+    const work = handle(req, res);
+    // 不把 shutdown 自己放进等待集合，否则会等待自身。URI 无法绕过内部的精确路由。
+    let path;
+    try { path = new URL(req.url, 'http://127.0.0.1').pathname; } catch {}
+    const mutation = req.method === 'POST' && !['/api/shutdown', '/api/resume'].includes(path);
+    if (mutation) activeOperations.add(work);
+    work.catch(() => { if (!res.headersSent) json(res, 400, { error: '请求无效' }); else res.destroy(); })
+      .finally(() => activeOperations.delete(work));
   });
-
+  server.drain = drain;
+  server.requestTimeout = 15_000;
+  server.headersTimeout = 10_000;
   server.listen(port, host);
   server.on('close', () => {
     for (const c of clients) {
@@ -223,56 +249,8 @@ export function createAppServer({ app, host = '127.0.0.1', port = 7788, uiFile =
 // ── CLI 入口 ────────────────────────────────────────────────────────────
 const isMain = !isSea() && process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];
 if (isMain) {
-  // 包成 async IIFE 而不是用顶层 await：esbuild 打 CJS 单文件时不接受顶层 await，
-  // 而 Node SEA 只吃 CJS。包一层之后 CLI 行为完全不变（同一个进程、同一套信号处理）。
-  (async () => {
-  const argOf = (n, d) => {
-    const i = process.argv.indexOf(`--${n}`);
-    return i >= 0 && process.argv[i + 1] ? process.argv[i + 1] : d;
-  };
-  const host = argOf('host', '127.0.0.1');
-  const port = Number(argOf('port', '7788'));
-
-  const app = new AppService({ dir: argOf('dir', undefined), coreBinary: argOf('core', undefined) });
-
-  // 单实例：两个实例会互相覆盖系统代理，且抢同一端口 —— 必须拒绝第二个
-  const lock = acquireLock(`${app.dir}/app.lock`);
-  if (!lock.ok) {
-    console.error(`已有实例在运行（PID ${lock.pid}）。请先关闭它，或直接使用那个窗口。`);
-    process.exit(1);
-  }
-  if (lock.stalePid) console.log(`[锁] 接管了上次异常退出留下的锁（原 PID ${lock.stalePid}）`);
-
-  const healed = await app.boot();
-  // 订阅参数会轮换，后台按时刷新，避免"昨天能用今天连不上"
-  app.startAutoRefresh();
-  if (healed.healed) console.log(`[自愈] 已还原上次异常退出留下的系统代理设置 → ${JSON.stringify(healed.restoredTo)}`);
-
-  app.on('warn', (m) => console.log(`[警告] ${m}`));
-  app.on('connected', (m) => console.log(`[已连接] 节点=${m.node} pid=${m.pid}`));
-  app.on('disconnected', () => console.log('[已断开]'));
-  app.on('healed', (h) => console.log(`[自愈] ${JSON.stringify(h)}`));
-
-  createAppServer({ app, host, port });
-  console.log(`jms-client 引擎已启动 → http://${host}:${port}`);
-  console.log(`内核: ${app.coreBinary || '未找到（设置 SING_BOX 环境变量）'}`);
-  console.log(`模式: ${app.store.state.settings.mode}  端口: ${app.store.state.settings.port}`);
-
-  const shutdown = async (sig) => {
-    console.log(`\n收到 ${sig}，正在清理…`);
-    try {
-      if (app.store.state.runtime.connected) await app.disconnect();
-      else if (app.journal.isPending()) await app.boot();
-    } catch (e) {
-      console.error('清理失败：', e.message);
-    }
-    lock.release();
-    process.exit(0);
-  };
-  process.on('SIGINT', () => shutdown('SIGINT'));
-  process.on('SIGTERM', () => shutdown('SIGTERM'));
-  })().catch((e) => {
-    console.error(`引擎启动失败：${e?.stack || e}`);
-    process.exit(1);
+  import('./entry.mjs').then(({ runEngine }) => runEngine()).catch(error => {
+    console.error(`引擎启动失败：${error.message}`);
+    process.exitCode = 1;
   });
 }

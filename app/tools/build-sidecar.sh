@@ -137,13 +137,16 @@ fi
 
 note "产物冒烟测试（不依赖 node 命令）"
 SMOKE_DIR="$(mktemp -d)"
-PORT=18788
-"$BIN" --dir "$SMOKE_DIR" --host 127.0.0.1 --port "$PORT" >build/smoke.log 2>&1 &
+TOKEN="$(node -e 'process.stdout.write(require("node:crypto").randomBytes(32).toString("hex"))')"
+# 仅文件携带curl认证头，不把秘密写入命令行或日志。
+(umask 077; printf 'header = "Authorization: Bearer %s"\n' "$TOKEN" > "$SMOKE_DIR/curl.conf")
+PORT="$(node -e 'const s=require("node:net").createServer();s.listen(0,"127.0.0.1",()=>{console.log(s.address().port);s.close()})')"
+JMS_API_TOKEN="$TOKEN" JMS_INSTANCE_ID="sidecar-smoke" "$BIN" --isolated --dir "$SMOKE_DIR/state" --host 127.0.0.1 --port "$PORT" >build/smoke.log 2>&1 &
 SIDECAR=$!
 trap 'kill $SIDECAR 2>/dev/null || true; rm -rf "$SMOKE_DIR"' EXIT
 ok=0
 for _ in $(seq 1 60); do
-  if curl -sf "http://127.0.0.1:$PORT/api/state" >build/smoke-state.json 2>/dev/null; then ok=1; break; fi
+  if curl -sf --config "$SMOKE_DIR/curl.conf" "http://127.0.0.1:$PORT/api/state" >build/smoke-state.json 2>/dev/null; then ok=1; break; fi
   sleep 0.25
 done
 if [ "$ok" = "1" ]; then

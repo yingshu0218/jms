@@ -4,16 +4,20 @@
 // （Tauri 集成时，Rust 侧只需把本文件当作 Node sidecar 的入口来调。）
 
 import { withLatencyCore } from './latency-core.mjs';
+import { prepareIsolatedDirectory } from './isolation.mjs';
+import { validateSettings, CONFIG_FILENAMES } from '../core/settings.mjs';
 import { ProfilesService } from './profiles.mjs';
-import { EventEmitter } from 'node:events';
+import { EventEmitter, once } from 'node:events';
+import { randomBytes } from 'node:crypto';
+import { assertPortsAvailable, assertListenerOwnership } from './ports.mjs';
 import { writeFileSync, mkdirSync, readFileSync, existsSync, readdirSync, statSync, chmodSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, resolve, dirname } from 'node:path';
 
 import { Store } from './store.mjs';
 import { fetchSubscription, diffNodes, summarizeChange, dedupeNodes } from './subscription.mjs';
 import { ClashApi } from './clash-api.mjs';
 import { CoreSupervisor, resolveCoreBinary } from './supervisor.mjs';
-import { ProxyJournal, getAdapter, enableProxy, disableProxy, healIfNeeded, isPointingAtUs } from './sysproxy/index.mjs';
+import { ProxyJournal, getAdapter, MockAdapter, enableProxy, disableProxy, healIfNeeded, isPointingAtUs } from './sysproxy/index.mjs';
 import { parseSubscription } from '../core/parse.mjs';
 import { buildConfig, buildOutbounds, SELECTOR_TAG, ROUTING_MODES } from '../core/to-singbox.mjs';
 import { APP_PROFILES, buildTunPerAppConfig } from '../core/per-app.mjs';
@@ -23,9 +27,19 @@ import { runLinkCheck, DEFAULT_TARGETS } from './linkcheck.mjs';
 import { checkTunPrivilege, needsElevation, planElevation, relaunchArguments } from './privilege.mjs';
 
 export class AppService extends EventEmitter {
-  constructor({ dir, coreBinary, adapter, clashApiFactory, latencyCoreRunner = withLatencyCore } = {}) {
+  constructor({ dir, coreBinary, adapter, clashApiFactory, latencyCoreRunner = withLatencyCore, isolated = false, controlPort = 7788, supervisorFactory, portsAvailable = assertPortsAvailable, ruleSetProvider = ensureRuleSets, listenerOwnership = assertListenerOwnership } = {}) {
     super();
+    this.isolated = isolated;
+    this.controlPort = controlPort;
+    this.draining = false;
+    this.portsAvailable = portsAvailable;
+    this.ruleSetProvider = ruleSetProvider;
+    this.listenerOwnership = listenerOwnership;
+    this.supervisorFactory = supervisorFactory || (options => new CoreSupervisor(options));
+    this.coreSecret = randomBytes(32).toString('hex');
+    if (isolated) dir = prepareIsolatedDirectory(dir);
     this.store = new Store(dir);
+    if (isolated) this.store.write({ settings: { port: 12080, clashApi: '127.0.0.1:19090' } });
     this.dir = this.store.dir;
     this.varDir = join(this.dir, 'run');
     mkdirSync(this.varDir, { recursive: true, mode: 0o700 });
@@ -37,8 +51,9 @@ export class AppService extends EventEmitter {
 
     this.coreBinary = coreBinary || resolveCoreBinary();
     this.journal = new ProxyJournal(this.dir);
-    this.adapter = adapter || getAdapter(process.platform);
-    this.clashApiFactory = clashApiFactory || ((url) => new ClashApi(url));
+    // 隔离实例永远不使用宿主适配器，即使调用者误传真实适配器也不会接管系统设置。
+    this.adapter = isolated ? new MockAdapter({ mode: 'off' }) : adapter || getAdapter(process.platform);
+    this.clashApiFactory = clashApiFactory || ((url, options) => new ClashApi(url, options));
 
     this.supervisor = null;
     this.lastLatency = new Map();
@@ -46,12 +61,57 @@ export class AppService extends EventEmitter {
     this.latencyCoreRunner = latencyCoreRunner;
     this.busy = null;
     this.profiles = new ProfilesService(this);
+    if (isolated) this.profiles.fetchImpl = async (url, options) => {
+      const target = new URL(url);
+      if (target.protocol !== 'http:' || target.hostname !== '127.0.0.1' || target.username || target.password) throw new Error('隔离实例只接受本机测试订阅');
+      return fetch(url, { ...options, redirect: 'error' });
+    };
+  }
+
+  get busy() { return this._busy ?? null; }
+  set busy(value) { this._busy = value; if (!value) this.emit('idle'); }
+
+  assertMutable() {
+    if (this.draining) throw Object.assign(new Error('引擎正在退出，暂停新操作'), { code: 'DRAINING' });
+  }
+
+  assertNetworkAllowed() {
+    this.assertMutable();
+    if (this.isolated) throw Object.assign(new Error('隔离实例禁止真实网络接管、提权、检测与测速'), { code: 'ISOLATED' });
+  }
+
+  async shutdown() {
+    if (this.shutdownPromise) return this.shutdownPromise;
+    this.draining = true;
+    clearInterval(this.refreshTimer);
+    this.shutdownPromise = (async () => {
+      // 先停止接收新操作，再等待已进入的操作完成；取消 HTTP 不代表服务器已停止。
+      if (this.busy) await once(this, 'idle', { signal: AbortSignal.timeout(120_000) });
+      await this.disconnect();
+      if (this.supervisor?.isRunning() || this.journal.isPending()) throw new Error('恢复尚未完成，保留引擎以便重试');
+      return { ok: true };
+    })();
+    try { return await this.shutdownPromise; } finally { this.shutdownPromise = null; }
+  }
+
+  resume() {
+    if (this.shutdownPromise || this.busy) throw new Error('恢复仍在执行，请稍后重试');
+    this.draining = false;
+    this.startAutoRefresh();
+    return { ok: true };
+  }
+
+  validatedSettings(patch = this.store.state.settings) {
+    const settings = validateSettings(patch);
+    const apiPort = Number(settings.clashApi?.split(':').at(-1));
+    if (settings.port === apiPort || settings.port === this.controlPort || apiPort === this.controlPort) throw new Error('代理、内核 API 和引擎 HTTP 端口必须不同');
+    return settings;
   }
 
   // ── 状态 ───────────────────────────────────────────────────────────────
   apiClient() {
-    const addr = this.store.state.settings.clashApi;
-    return this.clashApiFactory(addr.startsWith('http') ? addr : `http://${addr}`);
+    const addr = (this.sessionSettings || this.store.state.settings).clashApi;
+    return this.clashApiFactory(addr.startsWith('http') ? addr : `http://${addr}`, { secret: this.coreSecret });
   }
 
   async connections() {
@@ -116,6 +176,7 @@ export class AppService extends EventEmitter {
    * 让界面能如实提示"本次未经过代理" —— 不能让人误以为代理链路正常。
    */
   async checkLinks({ targets = DEFAULT_TARGETS, timeoutMs = 8000, diagnose = true } = {}) {
+    this.assertNetworkAllowed();
     const running = Boolean(this.supervisor?.isRunning());
     const proxy = running ? { host: '127.0.0.1', port: Number(this.store.state.settings.port) } : null;
     if (!running) {
@@ -160,6 +221,7 @@ export class AppService extends EventEmitter {
 
   /** 订阅自动刷新（服务端参数轮换时的兜底） */
   startAutoRefresh({ intervalMs } = {}) {
+    if (this.draining || this.isolated) return null;
     const every = intervalMs ?? this.store.state.settings.autoRefreshMinutes * 60_000;
     if (this.refreshTimer) clearInterval(this.refreshTimer);
     if (!every || every <= 0) return null;
@@ -169,7 +231,7 @@ export class AppService extends EventEmitter {
   }
 
   async autoRefreshSubscriptions() {
-    if (this.autoRefreshing || this.busy || !this.store.state.profiles.length) return;
+    if (this.draining || this.isolated || this.autoRefreshing || this.busy || !this.store.state.profiles.length) return;
     this.autoRefreshing = true;
     try {
       const result = await this.profiles.refreshAll({ background: true });
@@ -201,6 +263,7 @@ export class AppService extends EventEmitter {
 
   /** 提权方案：外壳或用户按这个命令重启到特权模式 */
   async elevationPlan({ mode = this.store.state.settings.mode } = {}) {
+    this.assertNetworkAllowed();
     if (!['sysproxy', 'tun-per-app'].includes(mode)) throw new Error('无效的接管方式');
     const st = await this.privilegeStatus({ mode });
     if (st.ok) return { needed: false, ...st };
@@ -240,7 +303,7 @@ export class AppService extends EventEmitter {
   // ── 配置生成 ───────────────────────────────────────────────────────────
   writeConfig({ ruleSetPaths = {} } = {}) {
     const { nodes } = this.store.state.subscription;
-    const s = this.store.state.settings;
+    const s = this.validatedSettings();
     if (!nodes.length) throw new Error('没有可用节点，请先刷新订阅');
 
     const selected = Math.max(0, Math.min(s.selected, nodes.length - 1));
@@ -282,7 +345,9 @@ export class AppService extends EventEmitter {
       });
     }
 
-    const file = join(this.varDir, `config-${s.mode}.json`);
+    config.experimental.clash_api.secret = this.coreSecret;
+    const file = resolve(this.varDir, CONFIG_FILENAMES[s.mode]);
+    if (dirname(file) !== resolve(this.varDir)) throw new Error('配置路径越界');
     writeFileSync(file, JSON.stringify(config, null, 2), { mode: 0o600 });
     try {
       chmodSync(file, 0o600);
@@ -298,32 +363,47 @@ export class AppService extends EventEmitter {
 
   // ── 连接 / 断开 ────────────────────────────────────────────────────────
   async connect() {
+    this.assertNetworkAllowed();
     if (this.busy) throw new Error(`正在执行：${this.busy}`);
-    if (!this.supervisor?.isRunning() && !this.store.state.runtime.connected) this.profiles.applyPending();
+    // 对旧状态同样先验证，不能在下载、提权或生成文件后才发现非法模式/地址。
+    this.validatedSettings();
+    if (this.supervisor?.isRunning() && this.store.state.runtime.connected) return { connected: true, alreadyConnected: true, pid: this.supervisor.status().pid };
+    // 有恢复日志/旧会话时只能先断开，不能覆盖原始快照或失去旧进程的所有权。
+    if (this.supervisor || this.store.state.runtime.connected || this.journal.isPending()) throw new Error('仍有未清理的连接，请先断开或恢复后重试');
+    this.profiles.applyPending();
     if (!this.store.state.subscription.nodes.length) throw new Error('没有可用节点，请先刷新订阅');
     this.busy = 'connect';
     try {
       // TUN 模式的权限检查放在**最前面**：在下载规则集、写配置、起内核之前就拦掉，
       // 快速失败，不留下任何半成品状态。
       await this.#assertPrivilege();
+      this.validatedSettings();
+      this.coreSecret = randomBytes(32).toString('hex');
 
       // 先把规则集缓存到本地：远程规则集会让内核启动依赖网络，下载失败即 FATAL 退出
       this.emit('operation-progress', { stage: '准备大陆 IP / 域名规则集（每项最多15秒）', command: 'GET <公开规则集> → 本地缓存' });
-      const ruleSets = await ensureRuleSets({ dir: this.dir });
+      const ruleSets = await this.ruleSetProvider({ dir: this.dir, coreBinary: this.coreBinary });
       if (!ruleSets['geoip-cn'] || !ruleSets['geosite-cn']) {
         this.emit('warn', '规则集未完全就绪，本次使用内置兜底规则（分流与 DNS 就近解析可能略偏）');
       }
       const meta = this.writeConfig({ ruleSetPaths: ruleSets });
-      const settings = this.store.state.settings;
+      const settings = { ...this.store.state.settings };
+      this.sessionSettings = settings;
 
       if (!this.coreBinary) throw new Error('找不到内核二进制，请设置环境变量 SING_BOX');
 
-      this.supervisor = new CoreSupervisor({
+      const ports = [settings.port, Number(settings.clashApi.split(':').at(-1))];
+      await this.portsAvailable(ports);
+      this.supervisor = this.supervisorFactory({
         binaryPath: this.coreBinary,
         configPath: meta.configPath,
         workDir: this.varDir,
         logFile: join(this.store.logDir, 'core.log'),
-        readyCheck: () => this.apiClient().version(),
+        readyCheck: async () => {
+          // 先证明两监听属于刚spawn的PID，再向API发送秘密，不能信任任意/version。
+          await this.listenerOwnership(ports, this.supervisor.status().pid);
+          return this.apiClient().verifyOwnership();
+        },
       });
       this.#wireSupervisor();
 
@@ -365,6 +445,7 @@ export class AppService extends EventEmitter {
       await this.supervisor?.stop();
       this.supervisor?.closeLog();
       this.supervisor = null;
+      this.sessionSettings = null;
 
       this.store.markRuntime({ connected: false, startedAt: null, pid: null });
       this.profiles.applyPending();
@@ -380,8 +461,10 @@ export class AppService extends EventEmitter {
    * 否则只更新设置，下次连接生效。
    */
   async selectNode(index) {
+    this.assertMutable();
     const nodes = this.store.state.subscription.nodes;
-    const idx = Math.max(0, Math.min(Number(index), nodes.length - 1));
+    if (!Number.isSafeInteger(index) || index < 0 || index >= nodes.length) throw new Error('节点索引无效');
+    const idx = index;
     this.store.write({ settings: { selected: idx }, profiles: this.store.state.profiles.map(p => p.id === this.store.state.activeProfileId ? { ...p, selected: idx } : p) });
     const tag = this.nodeTags()[idx];
 
@@ -410,6 +493,7 @@ export class AppService extends EventEmitter {
    * 因此不必重连、不必重启内核。失败才退回"记录设置、重连后生效"。
    */
   async setRoutingMode(mode) {
+    this.assertMutable();
     if (!ROUTING_MODES.includes(mode)) throw new Error(`未知的路由模式: ${mode}`);
     this.store.write({ settings: { routingMode: mode } });
 
@@ -432,16 +516,15 @@ export class AppService extends EventEmitter {
       if (this.journal.isPending()) {
         await healIfNeeded({ adapter: this.adapter, journal: this.journal });
       }
-    } catch {
-      /* 留着日志，下次启动自愈 */
+    } catch (error) {
+      this.emit('warn', '系统代理恢复失败，保留内核与恢复日志以便重试');
+      throw error;
     }
-    try {
-      await this.supervisor?.stop();
-      this.supervisor?.closeLog();
-    } catch {
-      /* ignore */
-    }
+    // 若尚未确认退出，保留所有权；不能让下一次连接覆盖仍存活的进程。
+    await this.supervisor?.stop();
+    this.supervisor?.closeLog();
     this.supervisor = null;
+    this.sessionSettings = null;
     this.store.markRuntime({ connected: false, startedAt: null, pid: null });
   }
 
@@ -452,21 +535,24 @@ export class AppService extends EventEmitter {
     sup.on('crash', (info) => this.emit('warn', `内核异常退出（code=${info.code ?? 'null'}），正在重启`));
 
     sup.on('restarted', (st) => {
+      if (this.supervisor !== sup) return;
       this.store.markRuntime({ pid: st.pid, restarts: st.restarts });
       this.emit('restarted', st);
     });
 
     // 内核彻底起不来 → 必须撤掉系统代理，否则用户直接断网
     sup.on('giveup', async (info) => {
+      if (this.supervisor !== sup) return;
       this.emit('warn', `内核连续 ${info.restarts} 次启动失败，已停止重试`);
       try {
-        if (this.store.state.settings.mode === 'sysproxy' && this.journal.isPending()) {
+        if (this.journal.isPending()) {
           await disableProxy({ adapter: this.adapter, journal: this.journal });
           this.emit('warn', '已还原系统代理设置');
         }
       } catch (e) {
         this.emit('warn', `还原系统代理失败：${e.message}`);
       }
+      if (this.supervisor !== sup) return;
       this.store.markRuntime({ connected: false, pid: null });
       this.emit('gaveup', info);
     });
@@ -474,10 +560,11 @@ export class AppService extends EventEmitter {
 
   // ── 测速 ───────────────────────────────────────────────────────────────
   async measureLatency({ index, all = false } = {}) {
+    this.assertNetworkAllowed();
     if (this.busy) throw new Error('正在执行：' + this.busy);
     const nodes = this.store.state.subscription.nodes;
     if (!nodes.length) throw new Error('没有可用节点，请先导入订阅');
-    if (!all && index !== undefined && (!Number.isInteger(Number(index)) || !nodes[Number(index)])) throw new Error('节点索引无效');
+    if (!all && index !== undefined && (!Number.isInteger(index) || !nodes[index])) throw new Error('节点索引无效');
     this.busy = 'latency';
     try {
       if (this.supervisor?.isRunning()) return await this.measureWithApi(this.apiClient(), { index, all });
@@ -518,11 +605,11 @@ export class AppService extends EventEmitter {
 
   // ── 设置 ───────────────────────────────────────────────────────────────
   async updateSettings(patch) {
-    const next = { ...patch };
-    if (next.reverseApps !== undefined && typeof next.reverseApps !== 'boolean') throw new Error('反向应用名单必须是布尔值');
-    if (next.apps !== undefined && (!Array.isArray(next.apps) || next.apps.some(key => !Object.hasOwn(APP_PROFILES, key)))) {
-      throw new Error('应用名单包含不支持的应用');
-    }
+    this.assertMutable();
+    if (this.busy) throw new Error(`正在执行：${this.busy}`);
+    const next = validateSettings(patch);
+    if (!Object.keys(next).length) return this.store.state.settings;
+    this.validatedSettings({ ...this.store.state.settings, ...next });
     if (next.selected !== undefined) {
       const max = Math.max(0, this.store.state.subscription.nodes.length - 1);
       next.selected = Math.max(0, Math.min(Number(next.selected), max));

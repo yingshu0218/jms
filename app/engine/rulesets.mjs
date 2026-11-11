@@ -8,9 +8,13 @@
 // 做法：启动前把规则集下载到本地并缓存，配置里引用**本地文件**；
 // 下载失败也不阻断连接，退回到内置的少量兜底规则（宁可分流失准，也不能连不上网）。
 
-import { mkdirSync, existsSync, statSync, writeFileSync, renameSync, chmodSync } from 'node:fs';
+import { mkdirSync, existsSync, statSync, writeFileSync, renameSync, chmodSync, readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
+import { inflateSync } from 'node:zlib';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+const run = promisify(execFile);
 import bundledGeoIP from './bundled-geoip.json' with { type: 'json' };
 
 export const RULE_SET_SOURCES = {
@@ -35,7 +39,7 @@ export function hasRuleSet(dir, name = 'geoip-cn', { maxAgeMs = WEEK } = {}) {
   try {
     if (!existsSync(p)) return false;
     if (maxAgeMs > 0 && Date.now() - statSync(p).mtimeMs > maxAgeMs) return false;
-    return statSync(p).size > 1024;
+    return validRuleSetBytes(readFileSync(p));
   } catch {
     return false;
   }
@@ -51,8 +55,19 @@ export async function ensureRuleSet({
   fetchImpl = fetch,
   timeoutMs = 15000,
   maxAgeMs = WEEK,
+  coreBinary,
+  validateFile,
 } = {}) {
-  if (hasRuleSet(dir, name, { maxAgeMs })) return ruleSetPath(dir, name);
+  const verify = validateFile || (coreBinary ? async file => {
+    const output = `${file}.${randomUUID()}.json`;
+    try { await run(coreBinary, ['rule-set', 'decompile', '--output', output, file], { timeout: 15_000, maxBuffer: 64 * 1024 }); }
+    finally { rmSync(output, { force: true }); }
+  } : null);
+  const cached = async (age) => {
+    if (!hasRuleSet(dir, name, { maxAgeMs: age })) return false;
+    try { if (verify) await verify(ruleSetPath(dir, name)); return true; } catch { return false; }
+  };
+  if (await cached(maxAgeMs)) return ruleSetPath(dir, name);
   if (name === 'geoip-cn' && !hasRuleSet(dir, name, { maxAgeMs: 0 })) {
     const bytes = Buffer.from(bundledGeoIP.data, 'base64');
     if (createHash('sha256').update(bytes).digest('hex') === bundledGeoIP.sha256) {
@@ -66,26 +81,29 @@ export async function ensureRuleSet({
 
   const ac = new AbortController();
   const t = setTimeout(() => ac.abort(new Error('规则集下载超时')), timeoutMs);
+  const tmp = `${ruleSetPath(dir, name)}.${randomUUID()}.tmp`;
   try {
     const res = await fetchImpl(url, { signal: ac.signal, redirect: 'follow' });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const buf = Buffer.from(await res.arrayBuffer());
-    // .srs 是二进制格式，过小的响应体一定是错误页而不是规则集
-    if (buf.length < 1024) throw new Error(`响应体过小（${buf.length} 字节），可能不是规则集`);
+    // HTTP 200 与长度不是规则集校验。先验magic/版本/zlib，再让固定内核完整解析。
+    if (!validRuleSetBytes(buf)) throw new Error('不是有效的二进制规则集');
+    if (!verify) throw new Error('缺少内核规则集校验器，保留已有缓存');
     mkdirSync(ruleSetDir(dir), { recursive: true, mode: 0o700 });
-    const tmp = `${ruleSetPath(dir, name)}.tmp`;
     writeFileSync(tmp, buf, { mode: 0o600 });
     try {
       chmodSync(tmp, 0o600);
     } catch {
       /* Windows 上 chmod 语义不同 */
     }
+    await verify(tmp);
     renameSync(tmp, ruleSetPath(dir, name));
     return ruleSetPath(dir, name);
   } catch {
-    return hasRuleSet(dir, name, { maxAgeMs: 0 }) ? ruleSetPath(dir, name) : null;
+    return await cached(0) ? ruleSetPath(dir, name) : null;
   } finally {
     clearTimeout(t);
+    rmSync(tmp, { force: true });
   }
 }
 
@@ -96,4 +114,13 @@ export async function ensureRuleSets(opts = {}) {
     out[name] = await ensureRuleSet({ ...opts, name });
   }
   return out;
+}
+
+// 格式头依据固定 v1.14.3 common/srs/binary.go；只做前置筛查，不冒充完整解析。
+export function validRuleSetBytes(bytes) {
+  try {
+    return bytes.length >= 8 && bytes.length <= 16 * 1024 * 1024 &&
+      bytes.subarray(0, 3).toString('ascii') === 'SRS' && bytes[3] >= 1 && bytes[3] <= 5 &&
+      inflateSync(bytes.subarray(4), { maxOutputLength: 64 * 1024 * 1024 }).length > 0;
+  } catch { return false; }
 }

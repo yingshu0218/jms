@@ -229,7 +229,7 @@ test('Linux 未提权时提示 root 或 CAP_NET_ADMIN 两条路', async () => {
 });
 
 test('Linux：内核带 cap_net_admin 时无需 root（走能力路线放行）', {
-  skip: process.platform !== 'linux' && '文件 capability 验证仅适用于 Linux',
+  skip: (process.platform !== 'linux' || process.env.JMS_TEST_LINUX_CAPABILITIES !== '1') && '真实文件 capability 验证需 Linux 且显式 JMS_TEST_LINUX_CAPABILITIES=1',
 }, async (t) => {
   // 真实探测依赖 getcap 与真实文件；用一个临时文件造出「有 capability」的情形
   const { execFile } = await import('node:child_process');

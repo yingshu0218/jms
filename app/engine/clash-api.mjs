@@ -22,6 +22,7 @@ export class ClashApi {
     try {
       const res = await fetch(`${this.base}${path}`, {
         method,
+        redirect: 'error',
         headers: {
           ...this.#headers(),
           ...(body ? { 'Content-Type': 'application/json' } : {}),
@@ -36,6 +37,17 @@ export class ClashApi {
     } finally {
       clearTimeout(t);
     }
+  }
+
+  async verifyOwnership() {
+    const wrongSecret = (await import('node:crypto')).randomBytes(32).toString('hex');
+    const rejected = await fetch(`${this.base}/version`, {
+      headers: { Authorization: `Bearer ${wrongSecret}` },
+      redirect: 'error', signal: AbortSignal.timeout(3000),
+    });
+    await rejected.body?.cancel();
+    if (rejected.status !== 401) throw new Error('内核 API 未拒绝错误认证，不能确认本次内核身份');
+    return this.version();
   }
 
   async version() {

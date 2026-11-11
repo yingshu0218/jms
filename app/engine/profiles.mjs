@@ -16,6 +16,7 @@ export class ProfilesService {
     if (this.app.supervisor?.isRunning() || this.store.state.runtime.connected) throw new Error('请先断开代理，再切换或修改当前订阅');
   }
   async mutate(work) {
+    this.app.assertMutable();
     if (this.app.busy) throw new Error(`正在执行：${this.app.busy}`);
     this.app.busy = 'subscription';
     try { return await work(); } finally { this.app.busy = null; }

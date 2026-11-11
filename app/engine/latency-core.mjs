@@ -7,6 +7,7 @@ import { randomBytes } from 'node:crypto';
 import { buildOutbounds } from '../core/to-singbox.mjs';
 import { ClashApi } from './clash-api.mjs';
 import { CoreSupervisor } from './supervisor.mjs';
+import { assertListenerOwnership } from './ports.mjs';
 
 export async function withLatencyCore(binaryPath, nodes, work) {
   if (!binaryPath) throw new Error('找不到测速内核，请重新构建或安装应用');
@@ -31,7 +32,7 @@ export async function withLatencyCore(binaryPath, nodes, work) {
       outbounds: buildOutbounds(nodes).outbounds,
       experimental: { clash_api: { external_controller: `127.0.0.1:${port}`, secret } },
     }), { mode: 0o600 });
-    core = new CoreSupervisor({ binaryPath, configPath, workDir: dir, maxRestarts: 0, readyCheck: () => api.version() });
+    core = new CoreSupervisor({ binaryPath, configPath, workDir: dir, maxRestarts: 0, readyCheck: async () => { await assertListenerOwnership([port], core.status().pid); return api.verifyOwnership(); } });
     process.once('exit', stopOnExit);
     await core.start();
     return await work(api);

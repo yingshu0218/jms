@@ -1,12 +1,22 @@
 import XCTest
 @testable import JMSNative
 
+func authorizedTestLease() -> EngineLease {
+    let lease = EngineLease()
+    let credentials = lease.begin(isAlive: { true })
+    try! lease.confirmListener(instanceId: credentials.instanceId)
+    try! lease.confirm(instanceId: credentials.instanceId)
+    return lease
+}
+
 final class StubProtocol: URLProtocol {
     static var failure: URLError.Code?
+    static var requests: [URLRequest] = []
     static var reply: (Int, String) = (200, "{}")
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
     override func startLoading() {
+        Self.requests.append(request)
         if let failure = Self.failure { client?.urlProtocol(self, didFailWithError: URLError(failure)); return }
         let (status, text) = Self.reply
         client?.urlProtocol(self, didReceive: HTTPURLResponse(url: request.url!, statusCode: status, httpVersion: nil, headerFields: ["Content-Type": "application/json"])!, cacheStoragePolicy: .notAllowed)
@@ -17,7 +27,7 @@ final class StubProtocol: URLProtocol {
 final class EngineTests: XCTestCase {
     func client() -> EngineClient {
         let config = URLSessionConfiguration.ephemeral; config.protocolClasses = [StubProtocol.self]
-        return EngineClient(session: URLSession(configuration: config))
+        return EngineClient(session: URLSession(configuration: config), lease: authorizedTestLease())
     }
     func testDecodeRealEngineShape() throws {
         let json = #"{"settings":{"selected":0,"mode":"tun-per-app","port":2080,"clashApi":"127.0.0.1:9090","autoRefreshMinutes":360,"routingMode":"rule","localDns":"system","remoteDns":"https://1.1.1.1/dns-query","customRules":[],"apps":["chrome"],"reverseApps":true},"subscription":{"url":"https://example.com/…","hasUrl":true,"nodes":[],"updatedAt":null},"status":{"connected":false,"running":false,"pendingProxyJournal":false,"node":null,"busy":null}}"#

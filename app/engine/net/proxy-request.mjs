@@ -9,11 +9,12 @@
 
 import { request as httpRequest } from 'node:http';
 import { connect as tlsConnect } from 'node:tls';
+import { isIP } from 'node:net';
 
 const UA = 'jms-client-linkcheck/1.0';
 
 /** 单次探测：返回 { ok, status, latencyMs } 或 { ok:false, error, latencyMs } */
-export async function probe(urlStr, { proxy = null, timeoutMs = 8000 } = {}) {
+export async function probe(urlStr, { proxy = null, timeoutMs = 8000, ca } = {}) {
   const t0 = Date.now();
   try {
     const url = new URL(urlStr);
@@ -21,7 +22,7 @@ export async function probe(urlStr, { proxy = null, timeoutMs = 8000 } = {}) {
       throw new Error(`不支持的协议: ${url.protocol}`);
     }
     const status = url.protocol === 'https:'
-      ? await viaTls(url, proxy, timeoutMs)
+      ? await viaTls(url, proxy, timeoutMs, ca)
       : await viaHttp(url, proxy, timeoutMs);
     return { ok: true, status, latencyMs: Date.now() - t0 };
   } catch (e) {
@@ -73,12 +74,13 @@ function viaHttp(url, proxy, timeoutMs) {
 /**
  * https:// —— 先与代理建立 CONNECT 隧道，再在隧道上做 TLS 握手，最后发一个极小的 GET。
  *
- * 注意 rejectUnauthorized: false 是刻意的：本探测要回答的是"能不能连上"，
- * 而不是"证书是否可信"。某些出口会做 TLS 中间盒，开启校验会产生假失败。
+ * 必须验证证书与主机名；中间盒/自签名响应不代表目标站点可信可用。
  */
-function viaTls(url, proxy, timeoutMs) {
+function viaTls(url, proxy, timeoutMs, ca) {
   const deadline = Date.now() + timeoutMs;
   const port = Number(url.port) || 443;
+  const hostname = url.hostname.replace(/^\[|\]$/g, '');
+  const servername = isIP(hostname) ? undefined : hostname;
 
   return new Promise((resolve, reject) => {
     const resources = new Set();
@@ -95,14 +97,14 @@ function viaTls(url, proxy, timeoutMs) {
     const timer = setTimeout(() => fail(new Error('timeout')), timeoutMs);
 
     const startTls = (socket) => {
-      const tls = tlsConnect({ socket, servername: url.hostname, rejectUnauthorized: false });
+      const tls = tlsConnect({ socket, host: hostname, servername, rejectUnauthorized: true, ...(ca ? { ca } : {}) });
       resources.add(tls);
       tls.once('error', fail);
       tls.once('secureConnect', () => sendOverTls(tls, url, success, fail, deadline));
     };
 
     if (!proxy) {
-      const socket = tlsConnect({ host: url.hostname, port, servername: url.hostname, rejectUnauthorized: false });
+      const socket = tlsConnect({ host: hostname, port, servername, rejectUnauthorized: true, ...(ca ? { ca } : {}) });
       resources.add(socket);
       socket.once('error', fail);
       socket.once('secureConnect', () => sendOverTls(socket, url, success, fail, deadline));
@@ -153,7 +155,7 @@ function sendOverTls(socket, url, resolve, reject, deadline) {
   socket.once('error', onErr);
   socket.setTimeout(Math.max(800, deadline - Date.now()), () => done(reject, new Error('timeout')));
   socket.write(
-    `GET ${url.pathname}${url.search || '/'} HTTP/1.1\r\n` +
+    `GET ${url.pathname}${url.search} HTTP/1.1\r\n` +
       `Host: ${url.host}\r\n` +
       `User-Agent: ${UA}\r\n` +
       `Accept: */*\r\n` +

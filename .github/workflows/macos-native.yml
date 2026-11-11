@@ -1,0 +1,167 @@
+name: macOS native safety and build
+
+on:
+  push:
+    branches: [main, codex/macos-security-hardening]
+    paths:
+      - 'app/**'
+      - 'script/**'
+      - '.github/workflows/macos-native.yml'
+  pull_request:
+    paths:
+      - 'app/**'
+      - 'script/**'
+      - '.github/workflows/macos-native.yml'
+  workflow_dispatch:
+
+# Build-only, no release, repository mutation, signing credentials, or deployment.
+permissions:
+  contents: read
+concurrency:
+  group: macos-native-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: '22.23.3'
+  GO_VERSION: '1.25.5'
+
+jobs:
+  node-safety:
+    name: Isolated Node regression (not live network)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: app
+        shell: bash
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+      - run: npm ci --no-audit --no-fund
+      - name: Isolated tests (explicitly report skipped integration)
+        run: |
+          set -o pipefail
+          npm test | tee "$RUNNER_TEMP/node-safety.log"
+          {
+            echo '### Node isolation gate'
+            echo 'Only temporary data, mock adapters, fake children and loopback fixtures were exercised.'
+            echo 'Real sing-box integration and Linux capability cases are explicitly skipped, not verified.'
+            echo '```text'
+            tail -10 "$RUNNER_TEMP/node-safety.log"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  macos-native:
+    name: SwiftUI + fixed core (${{ matrix.arch }})
+    needs: node-safety
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    env:
+      GOTOOLCHAIN: local
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+      - name: Record exact checkout and toolchain
+        env:
+          EXPECTED_ARCH: ${{ matrix.arch }}
+        run: |
+          test "$(uname -m)" = "$EXPECTED_ARCH"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          mkdir -p app/build/ci
+          {
+            echo "commit=$(git rev-parse HEAD)"
+            sw_vers
+            uname -m
+            node --version
+            go version
+            swift --version
+            xcodebuild -version
+          } | tee app/build/ci/provenance.txt
+      - name: Install locked build dependencies
+        working-directory: app
+        run: npm ci --no-audit --no-fund
+      - name: Swift tests (must execute, no allow-failure)
+        run: |
+          set -o pipefail
+          swift test --package-path app/macos 2>&1 | tee app/build/ci/swift-tests.log
+          grep -Eq 'Executed [1-9][0-9]* tests?, with 0 failures' app/build/ci/swift-tests.log
+      - name: Build pinned sing-box 1.14.3 from source
+        working-directory: app
+        run: bash tools/build-macos-core.sh
+      - name: Isolated Node suite plus mandatory 27-config core check
+        env:
+          REQUIRE_CORE_CHECK: '1'
+        run: |
+          set -o pipefail
+          SING_BOX="$PWD/app/build/native-core/sing-box" ./app/verify.sh | tee app/build/ci/verify.log
+          grep -q 'PASS 27份macOS配置' app/build/ci/verify.log
+      - name: Build native Candidate without starting any GUI
+        env:
+          JMS_BUILD_CONFIGURATION: release
+        run: ./script/build_and_run.sh --build
+      - name: Validate native bundle, isolation and signed executables
+        env:
+          EXPECTED_ARCH: ${{ matrix.arch }}
+        run: bash app/tools/validate-native-bundle.sh
+      - name: Archive Candidate only (not a release)
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          ditto -c -k --sequesterRsrc --keepParent \
+            'app/dist/JMS Client Candidate.app' "app/build/ci/JMS-Native-Candidate-${ARCH}.zip"
+          {
+            echo '### Executed macOS gates'
+            echo "Checkout: $GITHUB_SHA / architecture: $ARCH"
+            echo 'Swift tests, isolated Node tests, fixed 1.14.3 configuration checks, native Candidate assembly and signature checks completed.'
+            echo 'The SEA smoke is isolated; no GUI, real subscription, system proxy, TUN, elevation, routing change, notarization or deployment was exercised.'
+            echo 'macOS 13 runtime compatibility is NOT established by deployment-target checks.'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: success()
+        with:
+          name: JMS-Native-Candidate-${{ matrix.arch }}-${{ github.sha }}
+          path: app/build/ci/
+          if-no-files-found: error
+          retention-days: 7
+
+  required-native-gates:
+    name: Required isolated macOS gates
+    if: always()
+    needs: [node-safety, macos-native]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Do not treat skipped or failed jobs as verified
+        env:
+          NODE_RESULT: ${{ needs.node-safety.result }}
+          MACOS_RESULT: ${{ needs.macos-native.result }}
+        run: |
+          test "$NODE_RESULT" = success
+          test "$MACOS_RESULT" = success
+          echo 'Required isolated build/test gates passed; live network, TUN and macOS 13 runtime remain unverified.' >> "$GITHUB_STEP_SUMMARY"

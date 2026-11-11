@@ -12,19 +12,32 @@ import SwiftUI
     @Published var showTunPermission = false
     var shutdownError: String?
     @Published var ready = false
+    @Published private(set) var shuttingDown = false
     @Published var logs: [String] = []
     @Published var latency = ""
     @Published var checking = false
     @Published var routingModePending: String?
     @Published var checks = "尚未检测"
-    let runtime = EngineRuntime()
+    let runtime: EngineRuntime
+    init(runtime: EngineRuntime? = nil) {
+        self.runtime = runtime ?? EngineRuntime()
+        self.runtime.onTermination = { [weak self] in
+            guard let self else { return }
+            self.polling?.cancel(); self.events?.cancel()
+            self.polling = nil; self.events = nil; self.ready = false
+            if !self.shuttingDown { self.error = "自有引擎已退出，已停止轮询与事件重连" }
+        }
+    }
     var client: EngineClient { runtime.client }
     private var polling: Task<Void, Never>?
     private var events: Task<Void, Never>?
+    private var mutationTask: Task<Void, Never>?
+    private var routingTask: Task<Void, Never>?
+    private var checkingTask: Task<Void, Never>?
     func start() {
-        guard polling == nil else { return }
+        guard polling == nil, !shuttingDown else { return }
         polling = Task {
-            do { try await runtime.start(); ready = true }
+            do { try await runtime.start(); try Task.checkCancellation(); ready = true }
             catch { self.error = error.localizedDescription; polling = nil; return }
             events = Task { await subscribe() }
             while !Task.isCancelled {
@@ -40,9 +53,9 @@ import SwiftUI
         if revision == stateRevision { snapshot = result }
     }
     func perform(label: String = "正在执行操作", command: String = "本地引擎请求", _ action: @escaping () async throws -> Void) {
-        guard !working else { return }; working = true; workingTitle = label; workingCommand = command; workingStarted = Date()
-        Task {
-            defer { working = false }
+        guard !working, !shuttingDown else { return }; working = true; workingTitle = label; workingCommand = command; workingStarted = Date()
+        mutationTask = Task {
+            defer { working = false; mutationTask = nil }
             do {
                 try await action()
                 stateRevision += 1
@@ -72,12 +85,12 @@ import SwiftUI
         }
     }
     func setRoutingMode(_ mode: String) {
-        guard ready, !working, routingModePending == nil,
+        guard ready, !shuttingDown, !working, routingModePending == nil,
               ["rule", "global", "direct"].contains(mode), snapshot?.settings.routingMode != mode else { return }
         routingModePending = mode
         stateRevision += 1
-        Task {
-            defer { routingModePending = nil }
+        routingTask = Task {
+            defer { routingModePending = nil; routingTask = nil }
             do {
                 let data = try await client.request("api/routing-mode", body: ["mode": mode])
                 let result = try JSONSerialization.jsonObject(with: data) as? [String: Any]
@@ -118,9 +131,9 @@ import SwiftUI
         }
     }
     func checkLinks() {
-        guard !checking else { return }; checking = true
-        Task {
-            defer { checking = false }
+        guard !checking, !shuttingDown else { return }; checking = true
+        checkingTask = Task {
+            defer { checking = false; checkingTask = nil }
             do {
             let data = try await self.client.request("api/linkcheck", body: [:])
             let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:]
@@ -138,8 +151,10 @@ import SwiftUI
     private func subscribe() async {
         while !Task.isCancelled {
             do {
-                var request = URLRequest(url: client.baseURL.appendingPathComponent("api/events")); request.timeoutInterval = 86400
-                let (bytes, response) = try await URLSession.shared.bytes(for: request)
+                var request = try client.makeRequest("api/events"); request.timeoutInterval = 86400
+                let activeClient = client
+                try activeClient.lease.validate(request)
+                let (bytes, response) = try await activeClient.session.bytes(for: request)
                 guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw APIError(message: "事件流连接失败") }
                 var kind = "message"
                 for try await line in bytes.lines {
@@ -163,7 +178,21 @@ import SwiftUI
         }
     }
     func shutdown() async -> Bool {
+        guard !shuttingDown else { return false }
+        shuttingDown = true
+        // Cancelling an HTTP request does not cancel its server-side operation.
+        // Drain in-flight mutations before asking the engine to reject new ones.
+        if !ready {
+            polling?.cancel()
+            await polling?.value
+            polling = nil
+        }
+        await mutationTask?.value
+        await routingTask?.value
+        await checkingTask?.value
+        if !ready && runtime.process?.isRunning != true { return true }
         do {
+            _ = try await client.request("api/shutdown", body: [:])
             try await ShutdownCoordinator.run(
                 status: { try await self.client.snapshot().status },
                 disconnect: { _ = try await self.client.request("api/disconnect", body: [:]) },
@@ -171,8 +200,9 @@ import SwiftUI
             polling?.cancel(); events?.cancel()
             return true
         } catch {
-            // 启动失败且没有子进程时允许退出；仍有子进程则保留以便重试。
-            if !ready && runtime.process?.isRunning != true { return true }
+            // Keep the owned engine alive on restoration failure, then allow retry.
+            _ = try? await client.request("api/resume", body: [:])
+            shuttingDown = false
             self.shutdownError = "退出未完成：\(error.localizedDescription)"
             return false
         }

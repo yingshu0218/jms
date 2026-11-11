@@ -19,11 +19,21 @@ export class ProxyJournal {
   }
 
   read() {
-    try {
-      return JSON.parse(readFileSync(this.file, 'utf8'));
-    } catch {
-      return null;
+    let text;
+    try { text = readFileSync(this.file, 'utf8'); }
+    catch (error) {
+      if (error.code === 'ENOENT') return null;
+      throw recoveryError();
     }
+    try {
+      const entry = JSON.parse(text);
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry) ||
+          !entry.previous || !['on', 'off'].includes(entry.previous.mode) ||
+          (entry.previous.mode === 'on' && (typeof entry.previous.host !== 'string' || !entry.previous.host ||
+            !Number.isInteger(entry.previous.port) || entry.previous.port < 1 || entry.previous.port > 65535)) ||
+          (entry.previousBase !== undefined && entry.previousBase !== null && (typeof entry.previousBase !== 'object' || Array.isArray(entry.previousBase)))) throw recoveryError();
+      return entry;
+    } catch { throw recoveryError(); }
   }
 
   isPending() {
@@ -32,6 +42,7 @@ export class ProxyJournal {
 
   /** 改动系统设置**之前**调用 */
   begin({ platform, previous, previousBase, target }) {
+    if (this.isPending()) throw recoveryError();
     const payload = {
       platform,
       previous: previous ?? { mode: 'off' },
@@ -55,4 +66,8 @@ export class ProxyJournal {
   clear() {
     rmSync(this.file, { force: true });
   }
+}
+
+function recoveryError() {
+  return Object.assign(new Error('系统代理恢复日志无效或尚未恢复，未修改网络设置；请保留日志并手动检查原设置'), { code: 'RECOVERY_REQUIRED' });
 }

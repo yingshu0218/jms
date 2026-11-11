@@ -19,7 +19,7 @@ final class TunPermissionTests: XCTestCase {
         StubProtocol.failure = nil
         StubProtocol.reply = (400, #"{"error":"权限不足","code":"NEED_ELEVATION","privilege":{"hint":"需要 root"}}"#)
         let config = URLSessionConfiguration.ephemeral; config.protocolClasses = [StubProtocol.self]
-        let client = EngineClient(session: URLSession(configuration: config))
+        let client = EngineClient(session: URLSession(configuration: config), lease: authorizedTestLease())
         do { _ = try await client.request("api/connect", body: [:]); XCTFail("应拒绝连接") }
         catch let error as APIError { XCTAssertEqual(error.code, "NEED_ELEVATION"); XCTAssertTrue(error.message.contains("需要 root")) }
         catch { XCTFail("错误类型不符") }

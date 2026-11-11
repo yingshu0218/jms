@@ -1,24 +1,17 @@
 # JMS 客户端
 
-Mac 主要界面现为 SwiftUI 原生版本，构建与运行见 [macos/README.md](macos/README.md)。在仓库根目录执行 `./script/build_and_run.sh`。下文的网页控制台和 Tauri / WebKit 路径继续作为备用。
-
-自研的跨平台本地代理客户端：**规则 / 全局 / 直连**三档路由、**按应用（进程级）分流**、
-系统代理与 TUN 两种接管方式。引擎用 Node 写，界面是单文件 HTML，桌面外壳可选用 Tauri 或系统 WebKit。
+Mac 的本轮支持范围是 **SwiftUI 原生界面 + 共享 Node/sing-box**，构建与运行见 [macos/README.md](macos/README.md)。网页控制台、Tauri / WebKit 是历史备用路径，尚未接入本轮新增的每实例 Bearer 认证，不作为可用或已验证的入口。
 
 ```bash
-npm install && npm start        # 启动 → 浏览器打开 http://127.0.0.1:7788
+npm test                              # 安全隔离单测，无真实网络接管
+./verify.sh                           # 隔离单测；可选固定内核的只读配置 check
 ```
 
-启动引擎前需准备 sing-box ≥ 1.14.3；`npm start` 本身不会下载内核。
-可用 `SING_BOX=/path/to/sing-box npm start` 指定路径；`./verify.sh` 和 macOS 打包脚本在缺少内核时会自动下载。
+源码引擎可用 `npm start` 启动，控制 API 必须携带本实例认证头；默认只监听回环地址。CLI 随机认证信息仅写入自己状态目录的 `api-auth.json`（0600），不输出秘密，不接受 URL 传 token。原生应用在每次启动时随机生成认证信息并通过子进程环境传递，不复用其他引擎。
 
-## 三条上手路径
+正式原生应用的普通运行入口是仓库根目录 `./script/build_and_run.sh`，会安全退出旧实例、构建并启动。**不要用普通运行入口测试正在使用网络代理的机器。** `./script/build_and_run.sh --build` 仅生成独立 Candidate；Candidate 引擎禁止真实接管与外部订阅。
 
-| 你想做什么 | 怎么做 | 需要什么 |
-|---|---|---|
-| **先看看界面和交互** | `npm start` | 只要 Node |
-| **要一个能双击的原生应用** | `./tools/make-macos-app.sh --swift` | + Xcode 命令行工具 |
-| **完整外壳（托盘 / 开机自启）** | `./tools/make-macos-app.sh --tauri`，或用 CI | + Rust |
+配置门禁使用固定 sing-box **1.14.3**：`SING_BOX=/absolute/path/to/sing-box REQUIRE_CORE_CHECK=1 ./verify.sh`。该脚本不自动下载或启动内核。首次 macOS 打包仍需要网络准备固定运行时与源码内核。
 
 ## 文档索引
 

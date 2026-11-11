@@ -1,3 +1,4 @@
+import { authenticatedFetch as fetch, TEST_SERVER_AUTH } from './http-fixture.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
@@ -71,7 +72,7 @@ test('订阅：并发修改不覆盖状态；每份订阅保留节点选择，�
  let release;app.profiles.fetchImpl=()=>new Promise(r=>{release=r;});const pending=app.profiles.refresh(a.id);await assert.rejects(()=>app.profiles.remove(b.id),/正在执行/);release(new Response(first));await pending;
 });
 test('订阅 API：通过 HTTP 管理和切换，列表脱敏，旧接口继续可用', async t=>{
- const app=setup(t);const server=createAppServer({app,port:0});await once(server,'listening');t.after(()=>{server.closeAllConnections();server.close();});const base=`http://127.0.0.1:${server.address().port}`;
+ const app=setup(t);const server=createAppServer({app,port:0,...TEST_SERVER_AUTH});await once(server,'listening');t.after(()=>{server.closeAllConnections();server.close();});const base=`http://127.0.0.1:${server.address().port}`;
  const post=async(path,data)=>{const res=await fetch(base+path,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(data)});assert.equal(res.status,200);return res.json();};
  const a=await post('/api/profiles',{name:'One',url:'https://example.com/one?secret=HIDDEN'});const b=await post('/api/profiles',{name:'Two',url:'https://example.com/two'});
  await post('/api/profiles/activate',{id:b.id});let s=await(await fetch(base+'/api/state')).json();assert.equal(s.activeProfileId,b.id);

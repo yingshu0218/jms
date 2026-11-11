@@ -62,7 +62,8 @@ async function restoreTo(adapter, entry) {
 export async function disableProxy({ adapter, journal }) {
   if (!adapter || !journal) throw new Error('disableProxy 需要 adapter 与 journal');
   const entry = journal.read();
-  const previous = entry?.previous || { mode: 'off' };
+  if (!entry) return { restored: null, hadJournal: false };
+  const previous = entry.previous;
   await restoreTo(adapter, entry);
   journal.clear();
   return { restored: previous, hadJournal: Boolean(entry) };

@@ -430,7 +430,7 @@ test(
       })(),
       settings: { port: 13090, clashApi: '127.0.0.1:19090', mode: 'sysproxy' },
     });
-    app.apiClient = () => new ClashApi('http://127.0.0.1:19090');
+
 
     const warns = [];
     app.on('warn', (m) => warns.push(m));
