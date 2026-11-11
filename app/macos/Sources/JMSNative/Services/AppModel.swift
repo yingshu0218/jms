@@ -12,6 +12,7 @@ import SwiftUI
     @Published var showTunPermission = false
     var shutdownError: String?
     @Published var ready = false
+    @Published private(set) var startingEngine = false
     @Published private(set) var shuttingDown = false
     @Published var logs: [String] = []
     @Published var latency = ""
@@ -36,15 +37,21 @@ import SwiftUI
     private var checkingTask: Task<Void, Never>?
     func start() {
         guard polling == nil, !shuttingDown else { return }
+        startingEngine = true
         polling = Task {
-            do { try await runtime.start(); try Task.checkCancellation(); ready = true }
-            catch { self.error = error.localizedDescription; polling = nil; return }
+            do { try await runtime.start(); try Task.checkCancellation(); ready = true; startingEngine = false }
+            catch { self.error = error.localizedDescription; startingEngine = false; polling = nil; return }
             events = Task { await subscribe() }
             while !Task.isCancelled {
                 do { try await refresh() } catch { self.error = error.localizedDescription }
                 try? await Task.sleep(nanoseconds: 3_000_000_000)
             }
         }
+    }
+    func retryEngineRecovery() {
+        guard !ready, !startingEngine, !shuttingDown else { return }
+        error = nil; shutdownError = nil
+        start()
     }
     private var stateRevision = 0
     func refresh() async throws {
@@ -190,13 +197,23 @@ import SwiftUI
         await mutationTask?.value
         await routingTask?.value
         await checkingTask?.value
-        if !ready && runtime.process?.isRunning != true { return true }
+        if runtime.process?.isRunning != true {
+            if runtime.canExitWithoutLiveEngine { return true }
+            shuttingDown = false
+            shutdownError = "引擎已退出，无法确认系统代理已恢复。请点击“重新启动并恢复”，完成恢复后再退出。"
+            error = shutdownError
+            return false
+        }
+        let shutdownInstanceId = runtime.instanceId
         do {
             _ = try await client.request("api/shutdown", body: [:])
             try await ShutdownCoordinator.run(
                 status: { try await self.client.snapshot().status },
                 disconnect: { _ = try await self.client.request("api/disconnect", body: [:]) },
                 stop: { try await self.runtime.stopOwnedProcess() })
+            // Mark only after the authenticated shutdown, both status checks and
+            // owned process stop have all completed for this exact launch.
+            runtime.recordVerifiedCleanup(instanceId: shutdownInstanceId)
             polling?.cancel(); events?.cancel()
             return true
         } catch {

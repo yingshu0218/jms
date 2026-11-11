@@ -19,7 +19,7 @@ swift test --package-path macos              # 仅 macOS/Xcode，Linux 无法替
 - 仅构建 Candidate：仓库根目录 `./script/build_and_run.sh --build`。它不退出或启动已有应用；默认 run 模式不属于隔离测试入口。
 - `macos-preflight.sh` 和 `macos-sysproxy-roundtrip.mjs` **仍会真实修改系统代理**，不得把它们当只读或常规 CI 验证。本轮没有运行这些脚本。
 
-本轮已在 Linux / Node 24.22.1 验证：251 项，240 通过、0 失败、11 显式跳过；`verify.sh` 的官方内核阶段因缺少二进制显式跳过。新增 Swift 安全测试尚未编译/执行。未验证 macOS 构建、签名、真实内核启动、系统代理恢复、TUN、UI 交互、Intel/macOS 13 或正式分发。
+本轮已在 Linux / Node 24.22.1 验证：251 项，240 通过、0 失败、11 显式跳过；`verify.sh` 的官方内核阶段因缺少二进制显式跳过。本地 Linux 没有编译/执行 Swift；远程 macOS 构建与测试以对应提交的实际 Actions 日志为准，不能由本地跳过推断通过。真实内核接管、系统代理恢复、TUN、UI 交互、macOS 13 运行或正式分发仍未验证。
 
 
 ## 接手开发基线（2026-10-20）
@@ -226,10 +226,10 @@ HTTPS 返回 200、测速拿到真实延迟、切节点 PID 不变、断开精�
 - 真实测试：JMS 独立 2080 入口访问 Google 和 YouTube 均返回 HTTP 200。另有 Jamjam Network Extension 覆盖系统代理为 8080，故不能据此宣称浏览器默认路径已修复。
 - 用户要求保留 Jamjam 供 Codex 使用；后续仅构建 Candidate，不重新启动或切换当前系统网络。检查 Jamjam 仍为 Connected。Node 210 项通过、1 项平台跳过。
 
-## macOS Actions（待首次远程执行）
+## macOS Actions（按实际提交核验结果）
 
 根目录 `.github/workflows/macos-native.yml` 运行 Ubuntu 隔离 Node 回归，以及 macOS 15 arm64 / Intel 两个原生矩阵：锁定 npm 依赖、执行 Swift 测试、构建固定 sing-box 1.14.3、强制 27 份 macOS 配置 `check`、构建 release Candidate 并核对 `CFBundleExecutable=JMSNative`、隔离元数据、架构和签名。产物仅为短期 Candidate artifact，不创建 Release、推标签或部署。
 
 最终聚合门禁要求每个必需 job 的结果均为 success；跳过、失败、取消不视为完整通过。单测里显式跳过的真实内核/能力验证仍然没有完成，workflow summary 会明确列出。宏观“CI 成功”也不能代表真实代理/TUN或 macOS 13 运行验证。
 
-本地已完成 YAML 结构、固定 action SHA 与 shell 语法检查。未触发过此 workflow，不能据本地静态检查声称 GitHub/macOS 构建通过。
+本地已完成 YAML 结构、固定 action SHA 与 shell 语法检查。首轮受限CI已在独立分支触发；具体结果须检查对应 head SHA 的 job 与日志，不据静态检查、旧提交结果或跳过项声称最终 macOS 构建通过。

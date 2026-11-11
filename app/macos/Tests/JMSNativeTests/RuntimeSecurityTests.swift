@@ -186,15 +186,16 @@ final class RuntimeSecurityTests: XCTestCase {
         }
         XCTAssertTrue(called)
     }
-    @MainActor func testShutdownFailureReopensControlsForRetry() async {
-        StubProtocol.reply = (400, #"{"error":"恢复失败"}"#)
-        let runtime = EngineRuntime(client: client())
+    @MainActor func testLostEngineReopensControlsForRecovery() async {
+        var safety = EngineExitSafety()
+        safety.recordLaunch(instanceId: "lost-launch")
+        let runtime = EngineRuntime(client: client(), exitSafety: safety)
         let model = AppModel(runtime: runtime)
         model.ready = true
         let result = await model.shutdown()
         XCTAssertFalse(result)
         XCTAssertFalse(model.shuttingDown)
-        XCTAssertTrue(model.shutdownError?.contains("恢复失败") == true)
+        XCTAssertTrue(model.shutdownError?.contains("无法确认系统代理已恢复") == true)
         XCTAssertNil(runtime.process)
     }
     @MainActor func testShutdownWaitsForMutationAndBlocksNewWork() async {

@@ -4,6 +4,10 @@ import AppKit
     private(set) var process: Process?
     private(set) var client: EngineClient
     let configuration: RuntimeConfiguration
+    private(set) var exitSafety: EngineExitSafety
+    var hasLaunchedOwnedEngine: Bool { exitSafety.hasLaunchedOwnedEngine }
+    var canExitWithoutLiveEngine: Bool { exitSafety.canExitWithoutLiveEngine(isolated: configuration.isolated) }
+    func recordVerifiedCleanup(instanceId: String) { exitSafety.recordVerifiedCleanup(instanceId: instanceId) }
     var instanceId: String { client.lease.instanceId }
     var onTermination: (() -> Void)?
     private let resourcesDirectory: URL?
@@ -11,7 +15,9 @@ import AppKit
     private let listenerChecker: (Int32, Int) async throws -> Bool
     init(client: EngineClient? = nil, resourcesDirectory: URL? = Bundle.main.resourceURL,
          configuration: RuntimeConfiguration = RuntimeConfiguration(),
+         exitSafety: EngineExitSafety = EngineExitSafety(),
          listenerChecker: @escaping (Int32, Int) async throws -> Bool = { pid, port in try await EngineListenerOwnership.check(pid: pid, port: port) }) {
+        self.exitSafety = exitSafety
         self.listenerChecker = listenerChecker
         self.configuration = configuration
         self.client = client ?? EngineClient(baseURL: configuration.baseURL)
@@ -99,7 +105,12 @@ import AppKit
         environment["JMS_INSTANCE_ID"] = credentials.instanceId
         p.environment = environment
         p.standardOutput = log; p.standardError = log
-        do { try p.run(); process = p }
+        do {
+            try p.run()
+            process = p
+            // Boot can already touch a recovery journal before identity becomes ready.
+            exitSafety.recordLaunch(instanceId: credentials.instanceId)
+        }
         catch { lease.revoke(instanceId: credentials.instanceId); transport.invalidateAndCancel(); throw error }
     }
     func stopOwnedProcess() async throws {
