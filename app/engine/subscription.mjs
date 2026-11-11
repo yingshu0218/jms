@@ -12,19 +12,73 @@ const UA = 'jms-client/0.2 (sing-box)';
  * 拉取订阅。支持 ETag 条件请求（304 时不重复解析）。
  * 注意：超时用 AbortController 实现，不要依赖 fetch 的 socket 默认行为。
  */
-export async function fetchSubscription(url, { etag, timeoutMs = 20000, fetchImpl = fetch, ua = UA } = {}) {
-  if (!url) throw new Error('订阅链接为空');
+export const MAX_SUBSCRIPTION_BYTES = 5 * 1024 * 1024;
+const failure = (message, code) => Object.assign(new Error(message), {code});
+export async function fetchSubscription(url, { etag, timeoutMs = 20000, fetchImpl = fetch, ua = UA, maxBytes = MAX_SUBSCRIPTION_BYTES, maxRedirects = 5 } = {}) {
   const ac = new AbortController();
-  const timer = setTimeout(() => ac.abort(new Error('订阅拉取超时')), timeoutMs);
+  let reader;
+  let timer;
+  const deadline = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      const error = failure('订阅拉取超时', 'SUBSCRIPTION_TIMEOUT');
+      reject(error);
+      ac.abort(error);
+      reader?.cancel().catch(() => {});
+    }, timeoutMs);
+  });
+  const bounded = promise => Promise.race([promise, deadline]);
   try {
+    let target;
+    try { target = new URL(url); } catch { throw failure('Invalid subscription URL','SUBSCRIPTION_URL'); }
     const headers = { 'User-Agent': ua, Accept: '*/*' };
     if (etag) headers['If-None-Match'] = etag;
-    const res = await fetchImpl(url, { headers, redirect: 'follow', signal: ac.signal });
-    if (res.status === 304) return { notModified: true, etag };
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    return { body: await res.text(), etag: res.headers.get('etag') || null };
+    for (let redirects = 0; ; redirects++) {
+      if (!['https:','http:'].includes(target.protocol) || target.username || target.password) throw failure('Invalid subscription URL','SUBSCRIPTION_URL');
+      const res = await bounded(fetchImpl(target.href, { headers, redirect: 'manual', signal: ac.signal }));
+      if ([301,302,303,307,308].includes(res.status)) {
+        res.body?.cancel().catch(() => {});
+        if (redirects >= maxRedirects) throw failure('Subscription redirect limit exceeded','SUBSCRIPTION_REDIRECT');
+        let next;
+        try { const location = res.headers.get('location'); if (!location) throw new Error(); next = new URL(location,target); } catch { throw failure('Invalid subscription redirect','SUBSCRIPTION_REDIRECT'); }
+        if (target.protocol === 'https:' && next.protocol !== 'https:') throw failure('Subscription HTTPS downgrade rejected','SUBSCRIPTION_REDIRECT');
+        if (target.origin !== next.origin) delete headers['If-None-Match'];
+        target = next;
+        continue;
+      }
+      if (res.status === 304) {
+        if (!headers['If-None-Match']) throw failure('Unexpected subscription cache response', 'SUBSCRIPTION_HTTP');
+        return { notModified: true, etag };
+      }
+      if (!res.ok) { res.body?.cancel().catch(() => {}); throw failure(`HTTP ${res.status}`,'SUBSCRIPTION_HTTP'); }
+      if (Number(res.headers.get('content-length')) > maxBytes) { res.body?.cancel().catch(() => {}); throw failure('Subscription byte limit exceeded','SUBSCRIPTION_SIZE'); }
+      let body;
+      if (res.body?.getReader) {
+        reader = res.body.getReader();
+        const chunks = [];
+        let size = 0;
+        for (;;) {
+          const { value, done } = await bounded(reader.read());
+          if (done) break;
+          size += value.byteLength;
+          if (size > maxBytes) throw failure('Subscription byte limit exceeded','SUBSCRIPTION_SIZE');
+          chunks.push(Buffer.from(value));
+        }
+        try { body = new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks)); }
+        catch { throw failure('Subscription text encoding is invalid', 'SUBSCRIPTION_ENCODING'); }
+      } else {
+        // Compatibility for injected test transports; real fetch always streams.
+        body = await bounded(res.text());
+        if (Buffer.byteLength(body) > maxBytes) throw failure('Subscription byte limit exceeded','SUBSCRIPTION_SIZE');
+      }
+      return { body, etag: res.headers.get('etag') || null };
+    }
+  } catch (error) {
+    ac.abort();
+    if (typeof error.code === 'string' && error.code.startsWith('SUBSCRIPTION_')) throw error;
+    throw failure('订阅拉取失败', 'SUBSCRIPTION_FETCH');
   } finally {
     clearTimeout(timer);
+    if (reader) { reader.cancel().catch(() => {}); }
   }
 }
 

@@ -1,3 +1,4 @@
+import { createDarwinPreferencesAdapter } from './preferences.mjs';
 // 系统代理的平台适配器
 //
 // 设计要点：**命令生成与命令执行分离**。
@@ -26,12 +27,15 @@
 //     · ignore-hosts 是 GVariant 数组字面量，写成 "['localhost']" 这种形式。
 
 import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
+import { promisify, isDeepStrictEqual } from 'node:util';
 
 const run = promisify(execFile);
 
 async function sh(cmd, args, opts = {}) {
-  const { stdout } = await run(cmd, args, { windowsHide: true, maxBuffer: 4 * 1024 * 1024, timeout: 10000, ...opts });
+  const { input, ...options } = opts;
+  const pending = run(cmd, args, { windowsHide: true, maxBuffer: 4 * 1024 * 1024, timeout: 10000, ...options });
+  if (input !== undefined) pending.child.stdin.end(input);
+  const { stdout } = await pending;
   return stdout;
 }
 
@@ -251,12 +255,16 @@ export const MAC_KINDS = ['webproxy', 'securewebproxy', 'socksfirewallproxy'];
 
 /** 解析 `networksetup -getwebproxy "Wi-Fi"` 的输出 */
 export function parseMacProxy(out) {
-  const enabled = /Enabled:\s*Yes/i.test(out || '');
-  // 用 [ \t]* 而不是 \s*：未设置主机时输出是 "Server: " 加换行，
-  // \s* 会跨行把下一行的 "Port:" 当成主机名读进来。
-  const host = /Server:[ \t]*(\S+)/i.exec(out || '')?.[1] || null;
-  const port = Number(/Port:[ \t]*(\d+)/i.exec(out || '')?.[1] || 0) || null;
-  return { enabled, host, port };
+  const field = (name) => {
+    const values = [...String(out || '').matchAll(new RegExp('^' + name + ':[ \t]*(.*)$', 'gm'))];
+    if (values.length !== 1) throw darwinError('系统代理快照字段缺失或无法解析');
+    return values[0][1].trim();
+  };
+  const enabled = field('Enabled'), host = field('Server'), rawPort = field('Port');
+  const authenticated = field('Authenticated Proxy Enabled');
+  if (!['Yes', 'No'].includes(enabled) || !/^(0|[1-9]\d*)$/.test(rawPort) ||
+      Number(rawPort) > 65535 || !['0', '1'].includes(authenticated)) throw darwinError('系统代理快照无法解析');
+  return { enabled: enabled === 'Yes', host: host || null, port: Number(rawPort) || null, authenticated: authenticated === '1' };
 }
 
 export function parseMacServices(out) {
@@ -314,165 +322,229 @@ export function parseMacEffectiveProxy(out) {
  * @param mode 'on' | 'off' | 'restore'
  * @param base 快照（含 services 数组），restore / off 必需
  */
-export function planDarwin({ host, port, bypass, base, mode }) {
-  const steps = [];
-  const push = (args, optional) => steps.push({ cmd: 'networksetup', args, optional });
+export function darwinError(message = '系统代理恢复状态无法确认，未覆盖现有网络设置') {
+  return Object.assign(new Error(message), { code: 'RECOVERY_REQUIRED' });
+}
+const textValue = value => typeof value === 'string' && value.length > 0 && !/[\r\n\0]/.test(value);
+export function validateDarwinBase(base, { restorable = false } = {}) {
+  if (base?.schema !== 2 || !Array.isArray(base.services) || !base.services.length) throw darwinError('需要完整版本2系统代理快照');
+  const ids = new Set(), names = new Set();
+  for (const svc of base.services) {
+    if (!/^[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}$/.test(svc.id || '') || !textValue(svc.name) || !textValue(svc.device) || ids.has(svc.id) || names.has(svc.name)) throw darwinError('网络服务身份无效或重复');
+    ids.add(svc.id); names.add(svc.name);
+    for (const kind of MAC_KINDS) {
+      const p = svc[kind];
+      if (!p || typeof p.enabled !== 'boolean' || typeof p.authenticated !== 'boolean' ||
+          !(p.host === null || (textValue(p.host) && !/\s/.test(p.host))) || !(p.port === null || (Number.isInteger(p.port) && p.port > 0 && p.port <= 65535)) ||
+          (p.enabled && (!p.host || !p.port))) throw darwinError('系统代理快照不完整');
+      // networksetup cannot reveal passwords or reliably restore an unset stored
+      // endpoint. Refuse takeover rather than claiming a lossy rollback is safe.
+      if (restorable && (p.authenticated || !p.host || !p.port)) throw darwinError('认证代理或未设置的代理地址无法无损还原，已拒绝接管');
+    }
+    if (!Array.isArray(svc.bypass) || svc.bypass.some(v => !textValue(v) || /\s/.test(v) || v === 'Empty') ||
+        typeof svc.autodiscovery !== 'boolean' || !svc.autoproxy || typeof svc.autoproxy.enabled !== 'boolean' ||
+        !(svc.autoproxy.url === null || textValue(svc.autoproxy.url)) || (svc.autoproxy.enabled && !svc.autoproxy.url)) throw darwinError('自动代理或绕行快照不完整');
+  }
+  return base;
+}
+const canonicalBase = base => ({ schema: 2, services: [...base.services].sort((a, b) => a.id.localeCompare(b.id)) });
+const equalBase = (a, b) => isDeepStrictEqual(canonicalBase(a), canonicalBase(b));
+const clone = value => structuredClone(value);
 
+export function planDarwin({ host, port, bypass, base, mode }) {
+  validateDarwinBase(base, { restorable: mode !== 'off' });
+  if (!['on', 'off', 'restore'].includes(mode)) throw darwinError('无效系统代理操作');
+  const steps = [];
+  const push = args => steps.push({ cmd: 'networksetup', args });
   if (mode === 'restore') {
-    if (!base?.services?.length) throw new Error('还原需要快照');
     for (const svc of base.services) {
       for (const kind of MAC_KINDS) {
-        const cur = svc[kind];
-        if (!cur) continue;
-        if (cur.enabled && cur.host && cur.port) {
-          push([`-set${kind}`, svc.name, cur.host, String(cur.port)]);
-          push([`-set${kind}state`, svc.name, 'on']);
-        } else {
-          push([`-set${kind}state`, svc.name, 'off'], true);
-        }
+        const p = svc[kind];
+        // Stored addresses matter even while a proxy is disabled.
+        push([`-set${kind}`, svc.name, p.host, String(p.port), 'off']);
+        push([`-set${kind}state`, svc.name, p.enabled ? 'on' : 'off']);
       }
-      // 绕行域名：原本没有就必须清空，否则会留下我们写进去的那一份
-      if (svc.bypass && svc.bypass.length) {
-        push(['-setproxybypassdomains', svc.name, ...svc.bypass]);
-      } else {
-        push(['-setproxybypassdomains', svc.name, 'Empty'], true);
+      push(['-setproxybypassdomains', svc.name, ...(svc.bypass.length ? svc.bypass : ['Empty'])]);
+      // Takeover never changes the stored PAC URL, only its enabled flag.
+      push(['-setautoproxystate', svc.name, svc.autoproxy.enabled ? 'on' : 'off']);
+      push(['-setproxyautodiscovery', svc.name, svc.autodiscovery ? 'on' : 'off']);
+    }
+  } else if (mode === 'off') {
+    for (const svc of base.services) for (const kind of MAC_KINDS) push([`-set${kind}state`, svc.name, 'off']);
+  } else {
+    if (!textValue(host) || !Number.isInteger(port) || port < 1 || port > 65535) throw darwinError('代理目标无效');
+    const domains = bypass ?? DEFAULT_BYPASS_MACOS;
+    if (!Array.isArray(domains) || domains.some(v => !textValue(v) || /\s/.test(v) || v === 'Empty')) throw darwinError('绕行列表无效');
+    for (const svc of base.services) {
+      push(['-setautoproxystate', svc.name, 'off']);
+      push(['-setproxyautodiscovery', svc.name, 'off']);
+      for (const kind of MAC_KINDS) {
+        push([`-set${kind}`, svc.name, host, String(port), 'off']);
+        push([`-set${kind}state`, svc.name, 'on']);
       }
-      // 用户原来的自动代理配置必须被恢复，否则等于我们替他关掉了公司 PAC
-      const ap = svc.autoproxy;
-      if (ap?.url) {
-        push(['-setautoproxyurl', svc.name, ap.url]);
-        push(['-setautoproxystate', svc.name, ap.enabled ? 'on' : 'off']);
-      } else {
-        push(['-setautoproxystate', svc.name, 'off'], true);
-      }
-      push(['-setproxyautodiscovery', svc.name, svc.autodiscovery ? 'on' : 'off'], true);
+      push(['-setproxybypassdomains', svc.name, ...(domains.length ? domains : ['Empty'])]);
     }
-    return steps;
-  }
-
-  if (mode === 'off') {
-    for (const svc of base?.services || []) {
-      for (const kind of MAC_KINDS) push([`-set${kind}state`, svc.name, 'off'], true);
-    }
-    return steps;
-  }
-
-  for (const svc of base?.services || []) {
-    // 自动代理配置的优先级高于手动代理：必须先关，否则下面的设置会被静默忽略
-    push(['-setautoproxystate', svc.name, 'off'], true);
-    push(['-setproxyautodiscovery', svc.name, 'off'], true);
-    // 三个协议都设：sing-box 的 mixed 入站同时接受 HTTP 与 SOCKS，
-    // 所以 SOCKS 也指向同一个端口是正确的，不是笔误。
-    for (const kind of MAC_KINDS) {
-      push([`-set${kind}`, svc.name, host, String(port)]);
-      push([`-set${kind}state`, svc.name, 'on']);
-    }
-    const list = bypass?.length ? bypass : DEFAULT_BYPASS_MACOS;
-    push(['-setproxybypassdomains', svc.name, ...list]);
   }
   return steps;
 }
 
-export const darwinAdapter = {
-  platform: 'darwin',
-  defaultBypass: DEFAULT_BYPASS_MACOS,
-
-  async services() {
-    const names = parseMacServices(await sh('networksetup', ['-listallnetworkservices']));
-    const order = await sh('networksetup', ['-listnetworkserviceorder']);
-    return macProxyServices(names, order);
-  },
-
-  /** 默认路由走的是哪张网卡 → 反查服务名。比"取列表第一项"可靠得多。 */
-  async activeServiceName() {
-    try {
-      const route = await sh('route', ['-n', 'get', 'default']);
-      const dev = /interface:\s*(\S+)/.exec(route)?.[1];
-      if (!dev) return null;
-      const order = await sh('networksetup', ['-listnetworkserviceorder']);
-      return parseMacServiceOrder(order)[dev] ?? null;
-    } catch {
-      return null;
+// Expected complete states for one command, including networksetup versions that
+// enable a proxy while assigning an endpoint versus retaining its previous flag.
+function afterCommand(base, step) {
+  const next = clone(base), [command, name, value, port] = step.args;
+  const svc = next.services.find(s => s.name === name);
+  if (!svc) throw darwinError('网络服务身份已改变');
+  for (const kind of MAC_KINDS) {
+    if (command === `-set${kind}`) {
+      svc[kind] = { ...svc[kind], host: value, port: Number(port), authenticated: false };
+      const enabled = clone(next); enabled.services.find(s => s.name === name)[kind].enabled = true;
+      return [next, enabled];
     }
-  },
+    if (command === `-set${kind}state`) { svc[kind].enabled = value === 'on'; return [next]; }
+  }
+  if (command === '-setautoproxystate') svc.autoproxy.enabled = value === 'on';
+  else if (command === '-setproxyautodiscovery') svc.autodiscovery = value === 'on';
+  else if (command === '-setproxybypassdomains') svc.bypass = value === 'Empty' ? [] : step.args.slice(2);
+  else throw darwinError('未知系统代理写入命令');
+  return [next];
+}
 
-  async thread() {
-    const names = await darwinAdapter.services();
-    const services = [];
+export function createDarwinAdapter({ execute = sh } = {}) {
+  const command = (cmd, args, options = {}) => execute(cmd, args, { ...options, env: { ...process.env, LC_ALL: 'C', LANG: 'C' } });
+  const ns = args => command('networksetup', args);
+  const sc = input => command('scutil', [], { input: input + '\nquit\n' });
+  const scalar = (out, key) => {
+    const found = [...String(out).matchAll(new RegExp('^\\s*' + key + '\\s*:\\s*(.*?)\\s*$', 'gm'))];
+    if (found.length !== 1 || !found[0][1]) throw darwinError('网络服务身份无法解析');
+    return found[0][1];
+  };
+  async function identities() {
+    const listed = await ns(['-listallnetworkservices']);
+    if (!String(listed).startsWith('An asterisk (*) denotes')) throw darwinError('网络服务列表无法解析');
+    const names = parseMacServices(listed);
+    const order = await ns(['-listnetworkserviceorder']);
+    const entries = [...String(order).matchAll(/^\((\d+)\)[ \t]*(.+)\r?\n\(Hardware Port:[ \t]*([^,\r\n]+),[ \t]*Device:[ \t]*([^)\r\n]*)\)[ \t]*$/gm)]
+      .map(m => ({ name: m[2].trim(), device: m[4].trim() }));
+    const mapping = {};
     for (const name of names) {
-      const entry = { name, bypass: [] };
-      for (const kind of MAC_KINDS) {
-        try {
-          entry[kind] = parseMacProxy(await sh('networksetup', [`-get${kind}`, name]));
-        } catch {
-          entry[kind] = { enabled: false, host: null, port: null };
-        }
+      const matches = entries.filter(e => e.name === name);
+      if (matches.length !== 1) throw darwinError('网络服务顺序不完整或无法解析');
+      const device = matches[0].device;
+      if (device) {
+        if (mapping[device]) throw darwinError('网络设备身份不唯一');
+        mapping[device] = name;
       }
-      try {
-        const out = await sh('networksetup', ['-getproxybypassdomains', name]);
-        // 两种"没有绕行域名"的表述都要认
-        entry.bypass = /There aren't any bypass domains/i.test(out)
-          ? []
-          : out.split('\n').map((s) => s.trim()).filter(Boolean);
-      } catch {
-        entry.bypass = [];
-      }
-      try {
-        const out = await sh('networksetup', ['-getautoproxyurl', name]);
-        entry.autoproxy = {
-          url: /URL:[ \t]*(\S+)/i.exec(out)?.[1] || null,
-          enabled: /Enabled:\s*Yes/i.test(out),
-        };
-      } catch {
-        entry.autoproxy = { url: null, enabled: false };
-      }
-      try {
-        const out = await sh('networksetup', ['-getproxyautodiscovery', name]);
-        entry.autodiscovery = /Enabled:\s*On/i.test(out);
-      } catch {
-        entry.autodiscovery = false;
-      }
-      services.push(entry);
     }
-
-    // 对外视图取**实际承载默认路由**的那张网卡；识别不出来才退回第一张。
-    // 只影响展示与"是否指向我们"的判断，完整快照始终是全量的。
-    const activeName = await darwinAdapter.activeServiceName();
-    const active = services.find((s) => s.name === activeName) || services[0];
-    const web = active?.webproxy;
-    const on = Boolean(web?.enabled);
-    return {
-      mode: on ? 'on' : 'off',
-      host: on ? web.host : null,
-      port: on ? web.port : null,
-      bypass: active?.bypass?.length ? active.bypass : null,
-      service: active?.name ?? null,
-      base: { services },
-    };
-  },
-
-  async read() {
-    return parseMacEffectiveProxy(await sh('scutil', ['--proxy']));
-  },
-
-  plan(target) {
-    return planDarwin({ ...target, bypass: target.bypass ?? DEFAULT_BYPASS_MACOS });
-  },
-
-  async apply(target) {
-    const base = target.base ?? (await darwinAdapter.snapshot()).base;
-    if (!base?.services?.length) throw new Error('没有可配置系统代理的网络服务');
-    await execPlan(darwinAdapter.plan({ ...target, base }));
-  },
-
-  async restore(base) {
-    await execPlan(planDarwin({ mode: 'restore', base }));
-  },
-
-  async snapshot() {
-    return darwinAdapter.thread();
-  },
-};
+    const selected = names.filter(name => Object.values(mapping).includes(name));
+    if (!selected.length) throw darwinError('没有可配置系统代理的网络服务');
+    const listing = await sc('list Setup:/Network/Service/.*/Interface');
+    const ids = [...String(listing).matchAll(/Setup:\/Network\/Service\/([a-fA-F0-9-]+)\/Interface/g)].map(m => m[1]);
+    if (!ids.length || new Set(ids).size !== ids.length) throw darwinError('网络服务UUID无法解析');
+    const result = [];
+    for (const id of ids) {
+      const description = await sc(`show Setup:/Network/Service/${id}`);
+      const name = scalar(description, 'UserDefinedName');
+      if (!selected.includes(name)) continue;
+      const device = scalar(await sc(`show Setup:/Network/Service/${id}/Interface`), 'DeviceName');
+      if (mapping[device] !== name) throw darwinError('网络服务名称与设备身份不一致');
+      result.push({ id, name, device });
+    }
+    if (result.length !== selected.length || new Set(result.map(s => s.name)).size !== result.length) throw darwinError('网络服务UUID身份不完整');
+    return result.sort((a, b) => a.id.localeCompare(b.id));
+  }
+  async function snapshot() {
+    const services = [];
+    const initialIdentities = await identities();
+    for (const identity of initialIdentities) {
+      const svc = { ...identity };
+      for (const kind of MAC_KINDS) svc[kind] = parseMacProxy(await ns([`-get${kind}`, svc.name]));
+      const bypass = String(await ns(['-getproxybypassdomains', svc.name])).trim();
+      if (!bypass) throw darwinError('绕行列表读取为空，无法确认原状态');
+      svc.bypass = /^There aren't any bypass domains(?: set on .+)?\.?$/i.test(bypass) ? [] : bypass.split('\n').map(v => v.trim());
+      const pac = String(await ns(['-getautoproxyurl', svc.name]));
+      const urls = [...pac.matchAll(/^URL:[ \t]*(.*)$/gm)], enabled = [...pac.matchAll(/^Enabled:[ \t]*(.*)$/gm)];
+      if (urls.length !== 1 || enabled.length !== 1 || !['Yes', 'No'].includes(enabled[0][1].trim())) throw darwinError('PAC快照无法解析');
+      const url = urls[0][1].trim();
+      svc.autoproxy = { url: !url || url === '(null)' ? null : url, enabled: enabled[0][1].trim() === 'Yes' };
+      const discovery = String(await ns(['-getproxyautodiscovery', svc.name])).trim();
+      const match = /^(?:Auto Proxy Discovery|Enabled):[ \t]*(On|Off)$/i.exec(discovery);
+      if (!match) throw darwinError('自动发现快照无法解析');
+      svc.autodiscovery = match[1].toLowerCase() === 'on';
+      services.push(svc);
+    }
+    if (!isDeepStrictEqual(initialIdentities, await identities())) throw darwinError('读取期间网络服务身份发生变化，未修改设置');
+    const base = validateDarwinBase({ schema: 2, services });
+    const active = services[0], proxy = active.webproxy;
+    return { mode: proxy.enabled ? 'on' : 'off', host: proxy.enabled ? proxy.host : null,
+      port: proxy.enabled ? proxy.port : null, bypass: active.bypass.length ? active.bypass : null,
+      service: active.name, base };
+  }
+  function validateEntry(entry) {
+    if (entry?.version !== 2 || entry.platform !== 'darwin' || entry.darwin?.schema !== 1 || !Array.isArray(entry.darwin.states) || !entry.darwin.states.length) throw darwinError('恢复日志版本或平台不匹配，未修改设置');
+    validateDarwinBase(entry.previousBase, { restorable: true });
+    validateDarwinBase(entry.darwin.targetBase, { restorable: true });
+    for (const state of entry.darwin.states) validateDarwinBase(state, { restorable: true });
+    const identity = b => b.services.map(({ id, name, device }) => ({ id, name, device })).sort((a, b) => a.id.localeCompare(b.id));
+    for (const state of [entry.darwin.targetBase, ...entry.darwin.states]) if (!isDeepStrictEqual(identity(state), identity(entry.previousBase))) throw darwinError('恢复日志服务身份不一致');
+    if (!entry.darwin.states.some(s => equalBase(s, entry.previousBase))) throw darwinError('恢复日志缺少原始状态');
+  }
+  async function checkedCurrent(entry) {
+    validateEntry(entry);
+    const current = (await snapshot()).base;
+    if (!entry.darwin.states.some(state => equalBase(state, current))) throw darwinError('系统代理存在外部改动或网络服务变化，已保留恢复日志且未覆盖');
+    return current;
+  }
+  async function transact(steps, desired, journal) {
+    if (!journal?.updateDarwin) throw darwinError('写系统代理前必须具有可持久化事务日志');
+    let entry = journal.read(), current = await checkedCurrent(entry);
+    if (equalBase(current, desired)) return;
+    for (const step of steps) {
+      // Check all services before every write, not merely the one being changed.
+      entry = journal.read(); current = await checkedCurrent(entry);
+      const expected = afterCommand(current, step);
+      if (expected.every(state => equalBase(state, current))) continue;
+      const states = [...entry.darwin.states];
+      for (const state of expected) if (!states.some(s => equalBase(s, state))) states.push(state);
+      // Intent precedes the write, so a crash after partial execution is provable.
+      journal.updateDarwin({ ...entry.darwin, states });
+      try { await command(step.cmd, step.args); }
+      catch (error) { throw Object.assign(new Error('系统代理写入失败，恢复日志已保留'), { code: classifyExecError(error.message) || 'RECOVERY_REQUIRED' }); }
+      const actual = (await snapshot()).base;
+      if (!expected.some(state => equalBase(state, actual))) throw darwinError('系统代理命令读回不一致，恢复日志已保留');
+    }
+    if (!equalBase((await snapshot()).base, desired)) throw darwinError('系统代理最终读回不一致，恢复日志已保留');
+  }
+  return {
+    platform: 'darwin', transactionVersion: 2, defaultBypass: DEFAULT_BYPASS_MACOS,
+    services: async () => (await identities()).map(s => s.name),
+    activeServiceName: async () => {
+      const route = await command('route', ['-n', 'get', 'default']);
+      const device = /interface:\s*(\S+)/.exec(route)?.[1];
+      return (await identities()).find(s => s.device === device)?.name ?? null;
+    },
+    thread: snapshot, snapshot,
+    read: async () => parseMacEffectiveProxy(await command('scutil', ['--proxy'])),
+    plan: target => planDarwin({ ...target, bypass: target.bypass ?? DEFAULT_BYPASS_MACOS }),
+    prepareTransaction(snap, target) {
+      validateDarwinBase(snap.base, { restorable: true });
+      const steps = planDarwin({ ...target, base: snap.base });
+      let targetBase = clone(snap.base);
+      for (const step of steps) targetBase = afterCommand(targetBase, step).at(-1);
+      return { schema: 1, states: [clone(snap.base)], targetBase };
+    },
+    async apply(target, { journal } = {}) {
+      const entry = journal?.read(); validateEntry(entry);
+      await transact(planDarwin({ ...target, base: entry.previousBase }), entry.darwin.targetBase, journal);
+    },
+    async restore(base, { journal } = {}) {
+      const entry = journal?.read(); validateEntry(entry);
+      if (!equalBase(base, entry.previousBase)) throw darwinError('恢复目标与日志不符');
+      await transact(planDarwin({ mode: 'restore', base }), base, journal);
+    },
+    async verifyRestored(entry) { return equalBase(await checkedCurrent(entry), entry.previousBase); },
+  };
+}
+export const darwinAdapter = createDarwinAdapter();
 
 // ═══════════════════════════════ Linux (GNOME) ═══════════════════════════════
 const G = 'org.gnome.system.proxy';
@@ -572,7 +644,7 @@ export function getAdapter(platform = process.platform) {
     case 'win32':
       return win32Adapter;
     case 'darwin':
-      return darwinAdapter;
+      return process.env.JMS_PROXY_HELPER ? createDarwinPreferencesAdapter({readPublic: () => darwinAdapter.read()}) : darwinAdapter;
     case 'linux':
       return linuxAdapter;
     default:

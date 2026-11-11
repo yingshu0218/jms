@@ -4,7 +4,7 @@ import { fetchSubscription, dedupeNodes, diffNodes, summarizeChange } from './su
 import { parseSubscription } from '../core/parse.mjs';
 
 export const emptySubscription = () => ({ url: '', nodes: [], etag: null, updatedAt: null, lastError: null, lastChange: null });
-const safeError = (error) => /超时|timeout|abort/i.test(error.message) ? '订阅更新超时（20秒），原有节点已保留，可稍后重试' : /HTTP \d{3}$/.test(error.message) ? error.message : '订阅更新失败，请检查链接、内容和网络后重试';
+const safeError = (error) => error.code === 'SUBSCRIPTION_SIZE' ? '订阅内容超过安全上限，原有节点与选择已保留' : error.code === 'SUBSCRIPTION_REDIRECT' ? '订阅重定向无效或不安全，原有节点与选择已保留' : /node limit/i.test(error.message) ? '订阅节点数量超过5000，原有节点与选择已保留' : /超时|timeout|abort/i.test(error.message) ? '订阅更新超时（20秒），原有节点已保留，可稍后重试' : /HTTP \d{3}$/.test(error.message) ? error.message : '订阅更新失败，请检查链接、内容和网络后重试';
 export class ProfilesService {
   constructor(app, { fetchImpl = fetch } = {}) { this.app = app; this.store = app.store; this.fetchImpl = fetchImpl; }
   find(id) {
@@ -34,10 +34,10 @@ export class ProfilesService {
   commit(profile, activate) {
     if (activate) profile = { ...profile, pendingUpdate: false };
     const s = this.store.state;
-    if (s.activeProfileId && s.activeProfileId !== profile.id) {
-      s.profiles = s.profiles.map(p => p.id === s.activeProfileId ? { ...p, selected: s.settings.selected } : p);
-    }
-    const profiles = s.profiles.some(p => p.id === profile.id) ? s.profiles.map(p => p.id === profile.id ? profile : p) : [...s.profiles, profile];
+    const base = s.activeProfileId && s.activeProfileId !== profile.id
+      ? s.profiles.map(p => p.id === s.activeProfileId ? { ...p, selected: s.settings.selected } : p)
+      : s.profiles;
+    const profiles = base.some(p => p.id === profile.id) ? base.map(p => p.id === profile.id ? profile : p) : [...base, profile];
     const patch = { profiles };
     if (activate) {
       const same = s.activeProfileId === profile.id;
@@ -47,10 +47,13 @@ export class ProfilesService {
       patch.activeProfileId = profile.id;
       patch.subscription = { ...emptySubscription(), ...profile };
       patch.settings = { selected };
+    }
+    try { this.store.write(patch); }
+    catch (cause) { throw Object.assign(new Error('订阅保存失败，原有配置和缓存未改变'), { code: 'PERSIST_FAILED', cause }); }
+    if (activate) {
       this.app.lastLatency.clear();
       this.app.lastLatencyByTag?.clear();
     }
-    this.store.write(patch);
     this.app.emit('subscription', { nodes: profile.nodes.length });
   }
   async save({ id, name, url } = {}) {
@@ -84,6 +87,7 @@ export class ProfilesService {
         this.commit({ ...previous, ...loaded, pendingUpdate: deferApply }, active && !deferApply);
         return { id, nodes: loaded.nodes.length, pendingUpdate: deferApply, notModified: loaded.notModified, change: loaded.lastChange, summary: summarizeChange(loaded.lastChange), skipped: loaded.skipped || 0 };
       } catch (error) {
+        if (error.code === 'PERSIST_FAILED' || error.persistenceFailure) throw error;
         const message = safeError(error);
         this.store.write({ profiles: this.store.state.profiles.map(p => p.id === id ? { ...p, lastError: message } : p), ...(active ? { subscription: { lastError: message } } : {}) });
         throw new Error(message);
@@ -105,7 +109,7 @@ export class ProfilesService {
       const active = id === this.store.state.activeProfileId;
       if (active) this.assertDisconnected();
       this.store.write({ profiles: this.store.state.profiles.filter(p => p.id !== id), ...(active ? { activeProfileId: null, subscription: emptySubscription(), settings: { selected: 0 } } : {}) });
-      if (active) this.app.lastLatency.clear();
+      if (active) { this.app.lastLatency.clear(); this.app.lastLatencyByTag?.clear(); }
       this.app.emit('subscription', { removed: true });
       return { ok: true };
     });

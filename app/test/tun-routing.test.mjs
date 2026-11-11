@@ -42,7 +42,7 @@ test('TUN：每条分流规则都限定在目标进程上，绝不误伤其他�
   const { config } = build();
   for (const r of routeRules(config)) {
     // sniff / hijack-dns 是动作规则，不参与分流判定
-    if (r.action) continue;
+    if (r.action || r.inbound?.includes('mixed-in')) continue;
     assert.deepEqual(r.process_name, NAMES, `规则没有进程限定：${JSON.stringify(r)}`);
   }
 });
@@ -128,8 +128,8 @@ test('TUN：规则档做国内直连，全局档与直连档不做（由守卫�
     has(rules, (r) => r.domain_suffix === FALLBACK_CN_SUFFIXES || r.rule_set === 'geoip-cn');
 
   assert.ok(cnMatch(rule), '规则档应当有国内直连');
-  assert.ok(!cnMatch(global), '全局档不该做国内直连');
-  assert.ok(!cnMatch(direct), '直连档不该做国内直连');
+  assert.ok(cnMatch(global), '全局冷启动必须保留规则档规则');
+  assert.ok(cnMatch(direct), '直连冷启动必须保留规则档规则');
 });
 
 test('TUN：directRules=false 时规则档也不做国内直连', () => {
@@ -219,11 +219,11 @@ test('反向名单：名单先直连，站点规则只处理名单外应用，DN
     { type: 'domain_suffix', value: 'example.com', outbound: 'proxy' },
     { type: 'domain', value: 'corp.example', outbound: 'direct' },
   ] });
-  const rules = config.route.rules.filter(r => r.outbound);
+  const rules = config.route.rules.filter(r => r.outbound && !r.inbound);
   assert.deepEqual(rules[0], { process_name: NAMES, outbound: 'direct' });
   assert.equal(config.route.final, 'proxy');
   assert.ok(rules.some(r => r.domain_suffix?.includes('example.com') && !r.process_name));
-  assert.deepEqual(config.dns.rules[0], { process_name: NAMES, server: 'local' });
+  assert.deepEqual(config.dns.rules.find(r => !r.inbound), { process_name: NAMES, server: 'local' });
   assert.equal(config.dns.final, 'remote');
   assert.ok(config.dns.rules.some(r => r.domain?.includes('corp.example') && r.server === 'local'));
   assert.ok(config.dns.rules.some(r => r.clash_mode === 'direct'));
@@ -232,13 +232,13 @@ test('反向名单：名单先直连，站点规则只处理名单外应用，DN
 
 test('正向名单：名单外直连优先于所有用户规则', () => {
   const { config } = build({ customRules: [{ type: 'process_name', value: 'other', outbound: 'proxy' }] });
-  assert.deepEqual(config.route.rules.find(r => r.outbound), { process_name: NAMES, invert: true, outbound: 'direct' });
+  assert.deepEqual(config.route.rules.find(r => r.outbound && !r.inbound), { process_name: NAMES, invert: true, outbound: 'direct' });
 });
 
 test('空应用名单：正向全部直连，反向全部按规则分流', () => {
   const normal = buildTunPerAppConfig(NODES, { apps: [] }).config;
   assert.equal(normal.route.final, 'direct');
-  assert.equal(normal.route.rules.filter(r => r.outbound).length, 0);
+  assert.equal(normal.route.rules.filter(r => r.outbound && !r.inbound).length, 0);
   assert.equal(normal.dns.final, 'local');
   const reverse = buildTunPerAppConfig(NODES, { apps: [], reverseApps: true }).config;
   assert.equal(reverse.route.final, 'proxy');

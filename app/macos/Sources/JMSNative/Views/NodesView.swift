@@ -19,7 +19,7 @@ struct NodesView: View {
         return result.ok ? result.delay.map { "\($0) ms" } ?? "未测速" : result.error ?? "不可用"
     }
     private func switchNode(_ index: Int) {
-        guard model.ready, !model.working, model.snapshot?.settings.selected != index else { return }
+        guard model.canSwitch else { return }
         model.post("api/node", ["index": index])
     }
     var body: some View {
@@ -39,8 +39,8 @@ struct NodesView: View {
             }
             List(selection: $inspected) {
                 ForEach(nodes, id: \.0) { index, node in
-                    NodeRow(node: node, delay: delay(index), current: model.snapshot?.settings.selected == index, inspected: inspected == index,
-                            enabled: model.ready && !model.working,
+                    NodeRow(node: node, delay: delay(index), current: model.effectiveSelection == index, inspected: inspected == index,
+                            enabled: model.canSwitch,
                             switchNode: { switchNode(index) }, measure: { model.measure(index) },
                             info: { inspected = index; showingInfo = true })
                         .tag(index)
@@ -49,7 +49,7 @@ struct NodesView: View {
                         .background(ImmediateRowSelection { if inspected != index { inspected = index } })
                         .contextMenu {
                             Button("查看详情") { inspected = index; showingInfo = true }
-                            Button("切换到此节点") { switchNode(index) }.disabled(model.working || !model.ready || model.snapshot?.settings.selected == index)
+                            Button("切换到此节点") { switchNode(index) }.disabled(!model.canSwitch)
                             Button("测试延迟") { model.measure(index) }.disabled(model.working || !model.ready)
                         }
                 }
@@ -65,17 +65,18 @@ struct NodesView: View {
                             Text("\(node.type.uppercased()) · \(node.server):\(String(node.server_port)) · \(delay(inspected))").font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
                         }
                         Spacer(minLength: 0)
-                        Text(model.snapshot?.settings.selected == inspected ? "当前使用" : "仅查看").font(.caption).foregroundStyle(.secondary)
+                        Text(model.effectiveSelection == inspected ? "当前使用" : "仅查看").font(.caption).foregroundStyle(.secondary)
                     }
                 }
             }
-            Text("✓ 表示当前使用节点，蓝色高亮仅表示选中查看。测速无需连接。").font(.caption).foregroundStyle(.secondary)
+            Text(model.selectionSummary)
+            Text("✓ 表示已确认使用节点，蓝色高亮仅表示选中查看。测速无需连接。").font(.caption).foregroundStyle(.secondary)
         }
         .onChange(of: model.snapshot?.activeProfileId) { _ in inspected = nil; showingInfo = false }
         .onChange(of: model.snapshot?.subscription.nodes.map(\.id)) { _ in inspected = nil; showingInfo = false }
         .sheet(isPresented: $showingInfo) {
             if let node = inspectedNode, let inspected {
-                NodeInfoView(node: node, latency: delay(inspected), current: model.snapshot?.settings.selected == inspected)
+                NodeInfoView(node: node, latency: delay(inspected), current: model.effectiveSelection == inspected)
             }
         }
     }
@@ -106,7 +107,7 @@ private struct NodeRow: View {
             }
             Spacer(minLength: 6)
             Text(delay).font(.caption).monospacedDigit().foregroundStyle(.secondary)
-            if inspected && !current {
+            if inspected {
                 Button("切换", action: switchNode).buttonStyle(.bordered).disabled(!enabled)
             }
             Button(action: measure) { Image(systemName: "arrow.clockwise") }.help("测试此节点延迟").accessibilityLabel("测试此节点延迟").disabled(!enabled)

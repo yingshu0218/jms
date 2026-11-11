@@ -28,7 +28,7 @@ struct Node: Codable, Identifiable {
     let name: String; let type: String; let server: String; let server_port: Int
 }
 struct Subscription: Codable { let url: String; let hasUrl: Bool; let nodes: [Node]; let updatedAt: String? }
-struct EngineStatus: Codable { let connected: Bool; let running: Bool; let pendingProxyJournal: Bool; let node: String?; let busy: String?; var pointingAtUs: Bool? = nil }
+struct EngineStatus: Codable { let connected: Bool; let running: Bool; let pendingProxyJournal: Bool; let node: String?; let busy: String?; var pointingAtUs: Bool? = nil; var sessionId: String? = nil; var effective: EffectiveState? = nil; var persistenceError: String? = nil }
 struct SubscriptionProfile: Codable, Identifiable {
     let id: String; let name: String; let url: String; let nodeCount: Int
     let updatedAt: String?; let lastError: String?

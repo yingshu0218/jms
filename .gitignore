@@ -2,6 +2,8 @@
 Thumbs.db
 app/macos/.build/
 app/macos/.swiftpm/
+app/tools/proxy-preferences/.build/
+app/tools/proxy-preferences/.swiftpm/
 app/dist/
 
 # Per-instance runtime capabilities must never be committed.

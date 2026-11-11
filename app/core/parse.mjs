@@ -1,3 +1,5 @@
+import { validateNode } from './node-schema.mjs';
+export const MAX_SUBSCRIPTION_NODES = 5000;
 // 订阅解析层
 // 输入：订阅响应体（字符串）→ 输出：统一节点对象数组
 // 支持三种订阅形态：① base64 编码的分享链接列表 ② 明文分享链接列表 ③ Clash YAML（flow 风格 proxies）
@@ -6,9 +8,13 @@
 const SHARE_SCHEMES = ['vless', 'vmess', 'trojan', 'ss', 'ssr'];
 
 function b64decode(s) {
-  const t = String(s).replace(/-/g, '+').replace(/_/g, '/').replace(/\s+/g, '');
-  const pad = t.length % 4 ? '='.repeat(4 - (t.length % 4)) : '';
-  return Buffer.from(t + pad, 'base64').toString('utf8');
+  if (typeof s !== 'string') throw new Error('Invalid base64 content');
+  const t = s.replace(/-/g, '+').replace(/_/g, '/').replace(/[\t\n\r ]+/g, '');
+  if (!/^[A-Za-z0-9+/]*={0,2}$/.test(t) || t.replace(/=+$/, '').length % 4 === 1 || (t.includes('=') && t.length % 4 !== 0)) throw new Error('Invalid base64 content');
+  const bytes = Buffer.from(t, 'base64');
+  if (bytes.toString('base64').replace(/=+$/, '') !== t.replace(/=+$/, '')) throw new Error('Invalid base64 content');
+  try { return new TextDecoder('utf-8', { fatal: true }).decode(bytes); }
+  catch { throw new Error('Invalid UTF-8 subscription content'); }
 }
 
 export function looksLikeShareList(text) {
@@ -66,10 +72,12 @@ function splitLink(link) {
     hostport = rest.slice(at + 1);
   }
 
+  if (scheme === 'ss') hostport = hostport.replace(/\/$/, '');
   let server = hostport;
   let port = '';
   if (hostport.startsWith('[')) {
     const e = hostport.indexOf(']');
+    if (e < 0 || hostport[e + 1] !== ':') throw new Error('Invalid endpoint');
     server = hostport.slice(1, e);
     port = hostport.slice(e + 2);
   } else {
@@ -80,7 +88,7 @@ function splitLink(link) {
     }
   }
 
-  return { scheme, userinfo, server, port: Number(port), name, params: new URLSearchParams(query) };
+  return { scheme, userinfo, server, port: scheme === 'ss' && !userinfo ? NaN : numericPort(port), name, params: new URLSearchParams(query) };
 }
 
 function safeDecode(s) {
@@ -92,7 +100,7 @@ function safeDecode(s) {
 }
 
 /** 一条分享链接 → 节点对象 */
-export function parseShareLink(link) {
+function parseShareLinkUnchecked(link) {
   const raw = String(link).trim();
   if (!raw) throw new Error('空的分享链接');
   if (raw.toLowerCase().startsWith('vmess://')) return parseVmess(raw);
@@ -107,6 +115,11 @@ export function parseShareLink(link) {
     default:
       throw new Error(`暂不支持的协议: ${p.scheme}（当前支持 vless / vmess / trojan / ss）`);
   }
+}
+
+export function parseShareLink(link) {
+  try { return validateNode(parseShareLinkUnchecked(link)); }
+  catch (error) { throw Object.assign(new Error(error.code === 'INVALID_NODE' ? error.message : error.message.startsWith('ss:// 缺少 method:password') ? 'ss:// 缺少 method:password' : 'Invalid or unsupported share link'), {code: 'INVALID_NODE'}); }
 }
 
 // ---- VLESS ---------------------------------------------------------------
@@ -172,17 +185,21 @@ function parseVmess(link) {
   } catch {
     throw new Error('vmess:// 内容不是合法的 base64 JSON');
   }
+  if (!j || typeof j !== 'object' || Array.isArray(j)) throw new Error('Invalid VMess object');
+  for (const key of ['alpn','sni','host','path','fp']) if (j[key] !== undefined && typeof j[key] !== 'string') throw new Error('Invalid VMess string field');
+  if (j.ps !== undefined && typeof j.ps !== 'string') throw new Error('Invalid node name');
   if (!j.add || !j.port || !j.id) throw new Error(`VMess 节点缺少必要字段: ${j.ps || j.add || '(未命名)'}`);
 
-  const net = String(j.net || 'tcp').toLowerCase();
+  if (j.tls !== undefined && !['', 'none', 'tls'].includes(j.tls)) throw new Error('Invalid TLS');
+  const net = typeof j.net === 'string' ? j.net.toLowerCase() : j.net === undefined ? 'tcp' : null;
   const node = {
     name: j.ps || `${j.add}:${j.port}`,
     type: 'vmess',
     server: j.add,
-    server_port: Number(j.port),
+    server_port: numericPort(j.port),
     uuid: j.id,
-    alter_id: Number(j.aid ?? 0),
-    cipher: j.scy || 'auto',
+    alter_id: numericPort(j.aid === undefined ? 0 : j.aid),
+    cipher: j.scy === undefined ? 'auto' : j.scy,
     network: net,
     security: j.tls === 'tls' ? 'tls' : 'none',
     tls: { enabled: j.tls === 'tls' },
@@ -190,7 +207,7 @@ function parseVmess(link) {
   if (node.tls.enabled) {
     node.tls.server_name = j.sni || j.host || '';
     if (j.fp) node.tls.utls = { enabled: true, fingerprint: j.fp };
-    if (j.alpn) node.tls.alpn = String(j.alpn).split(',').map((s) => s.trim()).filter(Boolean);
+    if (j.alpn) node.tls.alpn = j.alpn.split(',').map((s) => s.trim()).filter(Boolean);
   }
   if (net === 'ws') node.ws = { path: j.path || '/', host: j.host || '' };
   if (net === 'grpc') node.grpc = { service_name: j.path || '' };
@@ -229,6 +246,7 @@ function decodeSsUserinfo(userinfo) {
 }
 
 function parseSs(p, raw) {
+  if (p.params.has('plugin')) throw new Error('Unsupported plugin');
   // 形态 A: ss://BASE64(method:pass)@host:port#name
   // 形态 B: ss://BASE64(method:pass@host:port)#name
   let method = '';
@@ -247,9 +265,9 @@ function parseSs(p, raw) {
     if (at < 0) throw new Error('ss:// 链接格式无法识别');
     userinfo = decoded.slice(0, at);
     const hp = decoded.slice(at + 1);
-    const c = hp.lastIndexOf(':');
-    server = hp.slice(0, c);
-    port = Number(hp.slice(c + 1));
+    const parsed = splitLink(`ss://unused@${hp}`);
+    server = parsed.server;
+    port = parsed.port;
   }
 
   const dec = decodeSsUserinfo(userinfo);
@@ -279,7 +297,7 @@ function parseTrojan(p) {
     type: 'trojan',
     server: p.server,
     server_port: p.port,
-    password: p.userinfo,
+    password: decodeURIComponent(p.userinfo),
     network,
     tls: { enabled: true, server_name: q.get('sni') || q.get('peer') || '' },
   };
@@ -297,74 +315,125 @@ function parseTrojan(p) {
 // 纯正则做不到 —— 正则遇到 `{` 就断掉，结果是 Reality 公钥丢失、生成一份静默连不上的配置。
 // 所以这里改用手写的花括号配对扫描。
 function parseFlowMap(body) {
-  const out = {};
-  const inner = body.trim().replace(/^\{/, '').replace(/\}$/, '');
+  // Deliberately small, strict flow-map subset. Unsupported YAML is not repaired.
   let i = 0;
-
-  while (i < inner.length) {
-    const km = /^[\s,]*([A-Za-z0-9_.-]+)\s*:\s*/.exec(inner.slice(i));
-    if (!km) break;
-    const key = km[1];
-    let j = i + km[0].length;
-
-    if (inner[j] === '{') {
-      // 嵌套对象：花括号配对，跳过引号内的括号
-      let depth = 0;
-      let quote = null;
-      let k = j;
-      for (; k < inner.length; k++) {
-        const ch = inner[k];
-        if (quote) {
-          if (ch === quote) quote = null;
-          continue;
-        }
-        if (ch === '"' || ch === "'") {
-          quote = ch;
-          continue;
-        }
-        if (ch === '{') depth++;
-        else if (ch === '}') {
-          depth--;
-          if (depth === 0) {
-            k++;
-            break;
-          }
-        }
+  const invalid = () => { throw new Error('Invalid or unsupported YAML flow syntax'); };
+  const space = () => { while (/\s/.test(body[i] ?? '') && i < body.length) i++; };
+  function quoted() {
+    const quote = body[i++];
+    let value = '';
+    while (i < body.length) {
+      const ch = body[i++];
+      if (ch === quote) {
+        if (quote === "'" && body[i] === "'") { value += "'"; i++; continue; }
+        return value;
       }
-      out[key] = parseFlowMap(inner.slice(j, k));
-      i = k;
-    } else {
-      // 标量：读到深度 0 的逗号为止；引号内的逗号不算分隔符
-      let quote = null;
-      let buf = '';
-      let k = j;
-      for (; k < inner.length; k++) {
-        const ch = inner[k];
-        if (quote) {
-          if (ch === quote) quote = null;
-          else buf += ch;
-          continue;
-        }
-        if (ch === '"' || ch === "'") {
-          quote = ch;
-          continue;
-        }
-        if (ch === ',' || ch === '}') break;
-        buf += ch;
+      if (ch === '\\' && quote === '"') {
+        const escape = body[i++];
+        const escapes = { '0': '\0', a: '\x07', b: '\b', t: '\t', n: '\n', v: '\v', f: '\f', r: '\r', e: '\x1b', ' ': ' ', '"': '"', '/': '/', '\\': '\\', N: '\u0085', _: '\u00a0', L: '\u2028', P: '\u2029' };
+        if (Object.hasOwn(escapes, escape)) value += escapes[escape];
+        else if (['x','u','U'].includes(escape)) {
+          const size = {x:2,u:4,U:8}[escape];
+          const hex = body.slice(i, i + size);
+          if (hex.length !== size || !/^[a-f0-9]+$/i.test(hex)) invalid();
+          const code = Number.parseInt(hex, 16);
+          if (code > 0x10ffff || (code >= 0xd800 && code <= 0xdfff)) invalid();
+          value += String.fromCodePoint(code); i += size;
+        } else invalid();
+      } else { if (/[\x00-\x1f\x7f]/.test(ch)) invalid(); value += ch; }
+    }
+    invalid();
+  }
+  function value(depth) {
+    space();
+    if (body[i] === '{') return map(depth + 1);
+    if (body[i] === '"' || body[i] === "'") return quoted();
+    const start = i;
+    while (i < body.length && body[i] !== ',' && body[i] !== '}') i++;
+    const scalar = body.slice(start, i).trim();
+    if (!scalar || /[\[\]{}'"#\x00-\x1f\x7f]/.test(scalar) || /^[&*!|>@%`]/.test(scalar) || /:\s/.test(scalar)) invalid();
+    if (scalar === 'true') return true;
+    if (scalar === 'false') return false;
+    if (scalar === 'null' || scalar === '~') return null;
+    if (/^-?\d+(?:\.\d+)?$/.test(scalar)) return Number(scalar);
+    return scalar;
+  }
+  function map(depth) {
+    if (depth > 16 || body[i++] !== '{') invalid();
+    const out = Object.create(null);
+    space();
+    if (body[i] === '}') { i++; return out; }
+    for (;;) {
+      space();
+      let key;
+      if (body[i] === '"' || body[i] === "'") key = quoted();
+      else {
+        const match = /^[A-Za-z0-9_.-]+/.exec(body.slice(i));
+        if (!match) invalid();
+        key = match[0]; i += key.length;
       }
-      out[key] = buf.trim();
-      i = k + 1;
+      space();
+      if (body[i++] !== ':' || Object.hasOwn(out,key) || ['__proto__','prototype','constructor'].includes(key)) invalid();
+      out[key] = value(depth);
+      space();
+      if (body[i] === '}') { i++; return out; }
+      if (body[i++] !== ',') invalid();
+      space();
+      if (body[i] === '}') { i++; return out; }
     }
   }
-  return out;
+  space();
+  const result = map(0);
+  space();
+  if (i !== body.length) invalid();
+  return result;
+}
+
+function numericPort(value) {
+  if (typeof value !== 'number' && (typeof value !== 'string' || !/^\d+$/.test(value))) throw new Error('Invalid port');
+  return Number(value);
+}
+
+function networkValue(value) { return value === undefined ? 'tcp' : value; }
+
+function validateClashFields(o) {
+  const has = (object, key) => Object.hasOwn(object, key);
+  const invalid = () => { throw new Error('Invalid or unsupported YAML node fields'); };
+  const map = object => { if (!object || typeof object !== 'object' || Array.isArray(object)) invalid(); };
+  const strings = (object, keys) => { for (const key of keys) if (has(object, key) && typeof object[key] !== 'string') invalid(); };
+  strings(o, ['type','name','server','uuid','password','cipher','network','flow','servername','sni','client-fingerprint']);
+  if (typeof o.type !== 'string') invalid();
+  for (const key of ['tls','skip-cert-verify']) if (has(o,key) && typeof o[key] !== 'boolean') invalid();
+  for (const key of ['plugin','plugin-opts','h2-opts','http-opts','httpupgrade-opts','xhttp-opts']) if (has(o,key)) invalid();
+  const network = networkValue(o.network);
+  if (!['tcp','ws','grpc'].includes(network)) invalid();
+  for (const [key, expected, fields] of [['ws-opts','ws',['path','headers']],['grpc-opts','grpc',['grpc-service-name']]]) {
+    if (!has(o,key)) continue;
+    if (network !== expected) invalid();
+    const opts = o[key]; map(opts);
+    if (Object.keys(opts).some(field => !fields.includes(field))) invalid();
+    strings(opts, expected === 'ws' ? ['path'] : ['grpc-service-name']);
+    if (has(opts,'headers')) {
+      map(opts.headers);
+      if (Object.keys(opts.headers).some(field => !['Host','host'].includes(field)) || (has(opts.headers,'Host') && has(opts.headers,'host'))) invalid();
+      strings(opts.headers,['Host','host']);
+    }
+  }
+  if (has(o,'reality-opts')) {
+    const reality = o['reality-opts']; map(reality);
+    if (o.type.toLowerCase() !== 'vless' || o.tls !== true || Object.keys(reality).some(key => !['public-key','short-id'].includes(key))) invalid();
+    strings(reality,['public-key','short-id']);
+    if (!has(reality,'public-key') || !reality['public-key']) invalid();
+  }
 }
 
 function clashProxyToNode(o) {
-  const type = String(o.type || '').toLowerCase();
+  validateClashFields(o);
+  const type = o.type.toLowerCase();
   const base = {
     name: o.name || `${o.server}:${o.port}`,
     server: o.server,
-    server_port: Number(o.port),
+    server_port: numericPort(o.port),
   };
   switch (type) {
     case 'vless': {
@@ -373,8 +442,8 @@ function clashProxyToNode(o) {
         type: 'vless',
         uuid: o.uuid,
         flow: o.flow || '',
-        network: 'tcp',
-        security: o.tls ? 'reality' : 'none',
+        network: networkValue(o.network),
+        security: o.tls ? (o['reality-opts'] ? 'reality' : 'tls') : 'none',
         tls: { enabled: !!o.tls },
       };
       if (o.tls) {
@@ -395,9 +464,9 @@ function clashProxyToNode(o) {
         ...base,
         type: 'vmess',
         uuid: o.uuid,
-        alter_id: Number(o.alterId ?? 0),
-        cipher: o.cipher || 'auto',
-        network: 'tcp',
+        alter_id: numericPort(o.alterId === undefined ? 0 : o.alterId),
+        cipher: o.cipher === undefined ? 'auto' : o.cipher,
+        network: networkValue(o.network),
         tls: { enabled: !!o.tls, server_name: o.servername || '' },
       };
     case 'ss':
@@ -409,11 +478,12 @@ function clashProxyToNode(o) {
   }
 }
 
-export function parseClashYaml(text) {
+export function parseClashYaml(text, { skipped = [], maxNodes = MAX_SUBSCRIPTION_NODES } = {}) {
   const nodes = [];
+  let count = 0;
   let inProxies = false;
   for (const raw of text.split(/\r?\n/)) {
-    const line = raw.replace(/\t/g, '  ');
+    const line = raw;
     if (/^proxies\s*:/.test(line)) {
       inProxies = true;
       continue;
@@ -426,8 +496,28 @@ export function parseClashYaml(text) {
     const t = line.trim();
     if (!t.startsWith('-')) continue;
     const body = t.slice(1).trim();
-    if (!body.startsWith('{')) continue; // 块状风格（多行）M1 暂不支持
-    nodes.push(clashProxyToNode(parseFlowMap(body)));
+    if (++count > maxNodes) throw new Error('Subscription node limit exceeded');
+    try {
+      if (!body.startsWith('{')) throw new Error('Unsupported YAML style');
+      const obj = parseFlowMap(body);
+      const node = clashProxyToNode(obj);
+      node.network = networkValue(obj.network);
+      if (node.network === 'ws') {
+        const opts = obj['ws-opts'] === undefined ? {} : obj['ws-opts'];
+        node.ws = { path: opts.path ?? '/', host: opts.headers?.Host ?? opts.headers?.host ?? '' };
+        if (Object.keys(opts).some(k => !['path','headers'].includes(k)) || (opts.headers && Object.keys(opts.headers).some(k => !['Host','host'].includes(k)))) throw new Error('Unsupported WS options');
+      }
+      if (node.network === 'grpc') {
+        const opts = obj['grpc-opts'] === undefined ? {} : obj['grpc-opts'];
+        node.grpc = { service_name: opts['grpc-service-name'] ?? '' };
+        if (Object.keys(opts).some(k => k !== 'grpc-service-name')) throw new Error('Unsupported gRPC options');
+      }
+      if (obj['skip-cert-verify'] !== undefined) {
+        if (typeof obj['skip-cert-verify'] !== 'boolean' || !node.tls) throw new Error('Invalid TLS option');
+        node.tls.insecure = obj['skip-cert-verify'];
+      }
+      nodes.push(validateNode(node));
+    } catch { skipped.push({ line: count, reason: 'Invalid or unsupported node' }); }
   }
   return nodes;
 }
@@ -435,20 +525,23 @@ export function parseClashYaml(text) {
 // ---- 统一入口 ------------------------------------------------------------
 
 /** 订阅响应体 → { format, nodes[], skipped[] } */
-export function parseSubscription(raw) {
+export function parseSubscription(raw, { maxNodes = MAX_SUBSCRIPTION_NODES } = {}) {
   const { format, body } = decodeSubscription(raw);
   if (format === 'clash-yaml') {
-    return { format, nodes: parseClashYaml(body), skipped: [] };
+    const skipped = [];
+    return { format, nodes: parseClashYaml(body, { skipped, maxNodes }), skipped };
   }
   const nodes = [];
   const skipped = [];
+  let count = 0;
   for (const line of body.split(/\r?\n/)) {
     const t = line.trim();
     if (!t || t.startsWith('#')) continue;
+    if (++count > maxNodes) throw new Error('Subscription node limit exceeded');
     try {
       nodes.push(parseShareLink(t));
     } catch (e) {
-      skipped.push({ line: t.slice(0, 60), reason: e.message });
+      skipped.push({ line: count, reason: e.message });
     }
   }
   return { format, nodes, skipped };

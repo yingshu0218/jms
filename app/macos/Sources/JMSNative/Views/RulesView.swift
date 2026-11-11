@@ -12,6 +12,7 @@ struct SiteRulesView: View {
     @EnvironmentObject var model: AppModel
     @State private var rule = Rule()
     @State private var importing = false
+    @State private var readingImport = false
     @State private var exporting = false
     @State private var document = JSONDocument()
     @State private var replace = false
@@ -62,16 +63,21 @@ struct SiteRulesView: View {
                 }.buttonStyle(.borderedProminent).disabled(rule.value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
             Text(notice).font(.caption).foregroundStyle(.secondary)
-        }.disabled(model.working || !model.ready)
+        }.disabled(model.working || !model.ready || readingImport)
         .fileImporter(isPresented: $importing, allowedContentTypes: [.json]) { result in
-            do {
-                let url = try result.get(); let access = url.startAccessingSecurityScopedResource(); defer { if access { url.stopAccessingSecurityScopedResource() } }
-                let data = try Data(contentsOf: url)
-                guard data.count <= 128 * 1024, let text = String(data: data, encoding: .utf8) else { throw APIError(message: "请选择 128 KB 以内的 UTF-8 JSON 文件") }
-                pendingImport = text
-                if replace { confirmImport = true } else { importPending() }
-            } catch { model.error = error.localizedDescription }
+            guard !readingImport else { return }
+            readingImport = true
+            Task { @MainActor in
+                defer { readingImport = false }
+                do {
+                    let url = try result.get()
+                    let text = try await Task.detached(priority: .userInitiated) { try BoundedRulesReader.read(url) }.value
+                    pendingImport = text
+                    if replace { confirmImport = true } else { importPending() }
+                } catch { model.error = error.localizedDescription }
+            }
         }
+
         .confirmationDialog("替换全部规则并恢复文件中的应用设置？", isPresented: $confirmImport) {
             Button("替换", role: .destructive) { importPending() }
             Button("取消", role: .cancel) { pendingImport = nil }

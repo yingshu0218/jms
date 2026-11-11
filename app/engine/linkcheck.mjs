@@ -7,12 +7,11 @@
 //    测的才是完整链路：本地入口 → 路由规则 → 出口节点 → 目标站。
 //
 // ② **失败时自动补一次直连对照**，据此给出诊断结论：
-//      直连也失败 → 目标本身不可达或网络受限（不是代理的问题）
-//      直连可达但代理失败 → 隧道/出口有问题
+//      直连也失败 → 不能仅据此排除代理、本机网络或目标服务问题
+//      直连成功但代理路径未成功 → 比较路径差异，不能排除目标策略
 //    这把两种完全不同的故障区分开了 —— 否则用户只会看到"不通"，无从下手。
 //
-// ③ **带一个对照组（Cloudflare）**。如果对照组也不通，说明是整条隧道断了；
-//    只有 Google/YouTube 不通而对照组通，则是出口 IP 被针对性识别。
+// ③ **带一个对照组（Cloudflare）**，辅助定位，不把单次HTTP结果当作根因证明。
 
 import { probe } from './net/proxy-request.mjs';
 
@@ -83,16 +82,16 @@ export function summarize(results) {
     verdict = '没有可检测的目标';
     level = 'warn';
   } else if (ok === total) {
-    verdict = '全部可达，链路正常';
+    verdict = '全部目标返回成功 HTTP 状态；未验证登录或页面内容';
     level = 'ok';
   } else if (control.length && !controlOk) {
-    verdict = '对照组也不通 —— 隧道本身可能已断开，请检查连接状态或更换节点';
+    verdict = '对照组未返回成功 HTTP 状态；请检查隧道、出口与目标策略，当前结果不能定位根因';
     level = 'bad';
   } else if (ok === 0) {
-    verdict = '全部不可达，但对照组本应可达 —— 建议更换节点后重试';
+    verdict = '所有目标均未返回成功 HTTP 状态，请检查本机网络、代理路径与目标服务后重试';
     level = 'bad';
   } else {
-    verdict = `部分站点不可达（${failed.length}/${total}）—— 链路是通的，可能是出口 IP 被针对性识别`;
+    verdict = `部分目标未成功（${failed.length}/${total}）；可能涉及网络、出口或目标策略，尚不能定位`;
     level = 'warn';
   }
 
@@ -131,13 +130,13 @@ export async function runLinkCheck({
       await Promise.all(
         failedItems.map(async (r) => {
           const direct = await probeImpl(r.url, { proxy: null, timeoutMs });
-          r.direct = { ok: direct.ok, status: direct.status, error: direct.error, latencyMs: direct.latencyMs };
+          r.direct = { ok: direct.ok, reachable: direct.reachable, serviceAvailable: direct.serviceAvailable, status: direct.status, error: direct.error, latencyMs: direct.latencyMs };
           if (direct.ok) {
-            r.diagnosis = '直连可达、代理不可达 → 问题在隧道或出口节点';
+            r.diagnosis = '经当前代理路径未成功、直连成功；可能与出口或目标策略有关，尚不能定位';
           } else if (r.group === 'control') {
-            r.diagnosis = '对照组且直连也不可达 → 更像本地网络问题，不是代理造成';
+            r.diagnosis = '对照组与直连均未成功，当前结果不能排除代理、本机网络或目标服务问题';
           } else {
-            r.diagnosis = '直连同样不可达 → 目标本身受限，与代理无关';
+            r.diagnosis = '代理与直连均未成功，当前结果无法定位故障，也不能排除代理问题';
           }
         }),
       );

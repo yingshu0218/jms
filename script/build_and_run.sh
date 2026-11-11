@@ -49,6 +49,8 @@ CONFIGURATION="${JMS_BUILD_CONFIGURATION:-release}"
 if [ "$MODE" = '--debug' ]; then CONFIGURATION=debug; fi
 case "$CONFIGURATION" in debug|release) ;; *) echo '无效构建配置'; exit 1;; esac
 swift build --package-path macos --configuration "$CONFIGURATION"
+swift build --package-path tools/proxy-preferences --configuration "$CONFIGURATION"
+HELPER_BIN_DIR="$(swift build --package-path tools/proxy-preferences --configuration "$CONFIGURATION" --show-bin-path)"
 BIN_DIR="$(swift build --package-path macos --configuration "$CONFIGURATION" --show-bin-path)"
 rm -rf "$APP_BUNDLE"
 mkdir -p "$APP_BUNDLE/Contents/MacOS" "$APP_BUNDLE/Contents/Resources/engine" "$APP_BUNDLE/Contents/Resources/core" "$APP_BUNDLE/Contents/Resources/ui"
@@ -56,6 +58,8 @@ cp "$BIN_DIR/JMSNative" "$APP_BUNDLE/Contents/MacOS/JMSNative"
 check_minimum "$APP_BUNDLE/Contents/MacOS/JMSNative"
 cp "src-tauri/binaries/jms-engine-$TRIPLE" "$APP_BUNDLE/Contents/Resources/engine/jms-engine"
 cp "$CORE" "$APP_BUNDLE/Contents/Resources/core/sing-box"
+cp "$HELPER_BIN_DIR/JMSProxyPreferences" "$APP_BUNDLE/Contents/Resources/engine/JMSProxyPreferences"
+check_minimum "$APP_BUNDLE/Contents/Resources/engine/JMSProxyPreferences"
 cp src-tauri/icons/icon.icns "$APP_BUNDLE/Contents/Resources/AppIcon.icns"
 mkdir -p "$APP_BUNDLE/Contents/Resources/Licenses"
 if [ -f build/native-node/LICENSE ]; then cp build/native-node/LICENSE "$APP_BUNDLE/Contents/Resources/Licenses/Node.txt"; fi
@@ -83,7 +87,7 @@ cat > "$APP_BUNDLE/Contents/Info.plist" <<PLIST
 <key>NSAppTransportSecurity</key><dict><key>NSAllowsLocalNetworking</key><true/></dict>
 </dict></plist>
 PLIST
-for executable in "$APP_BUNDLE/Contents/Resources/engine/jms-engine" "$APP_BUNDLE/Contents/Resources/core/sing-box" "$APP_BUNDLE/Contents/MacOS/JMSNative"; do
+for executable in "$APP_BUNDLE/Contents/Resources/engine/JMSProxyPreferences" "$APP_BUNDLE/Contents/Resources/engine/jms-engine" "$APP_BUNDLE/Contents/Resources/core/sing-box" "$APP_BUNDLE/Contents/MacOS/JMSNative"; do
   codesign --force --sign - "$executable"
 done
 codesign --force --sign - "$APP_BUNDLE"

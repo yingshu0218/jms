@@ -8,18 +8,31 @@
 npm test                                    # 纯本地隔离单测，不自动运行真实内核/能力变更
 ./verify.sh                                 # 同上；缺内核显式 SKIP
 SING_BOX=/absolute/path/to/sing-box REQUIRE_CORE_CHECK=1 ./verify.sh
+SING_BOX=/absolute/path/to/sing-box JMS_ALLOW_ISOLATED_CORE_TESTS=1 node tools/test-local-core.mjs --require
 swift test --package-path macos              # 仅 macOS/Xcode，Linux 无法替代
+swift test --package-path tools/proxy-preferences # 仅内存 PreferencesStore 模拟，不执行 CLI
 ```
 
 - `npm test` 使用临时目录、MockAdapter、本机 HTTP/TLS fixture 与假进程。清除真实内核环境并禁用自动内核发现，不改系统代理/TUN/路由，不提权、不接触真实订阅。
 - TLS fixture 在临时目录通过系统 `openssl` 生成当次测试证书。没有新增 npm 依赖。
-- 固定内核门禁只接受 sing-box **1.14.3**，对 27 份 **macOS** 系统代理/TUN 配置执行 `check`，不执行 `run`，不自动下载。可设 `REQUIRE_CORE_CHECK=1` 避免 CI 将缺内核的跳过当完整通过。
+- 固定内核门禁只接受 sing-box **1.14.3**，对 27 份 **macOS** 系统代理/TUN 配置执行 `check`，另检查 16 份规则正例与 10 份绕过 UI 的负例。不执行 `run`，不自动下载。可设 `REQUIRE_CORE_CHECK=1` 避免 CI 将缺内核的跳过当完整通过。
+- `test-local-core.mjs` 是独立、显式 opt-in 的真实内核门禁，不由 `npm test` 自动运行。仅启动自己拥有的临时 sing-box、回环 HTTP/SS 服务与 TCP 计数器；实际读回 mode/selector，验证模式切换及坏节点不能被直连掩盖。移除 TUN 捕获入站，不调用系统适配器、不查询外部 DNS、不访问公网。它不验证真实 TUN 进程识别或中国站点 DNS 效果。`--require` 缺少二进制/许可会失败，不把跳过当通过。
 - 真实内核集成与 Linux 文件 capability 测试默认跳过。能力测试额外需要 `JMS_TEST_LINUX_CAPABILITIES=1`，不属于本轮 macOS 隔离验证。
 - 原生 Candidate 为独立 bundle id、目录和 HTTP 端口，`--isolated` 引擎强制 MockAdapter，禁用接管、提权、检测、测速、自动刷新与外部订阅；仅接受 `http://127.0.0.1` 测试订阅且拒绝重定向。隔离实例必须显式指定空目录或已有专属标记的目录，遇到任何恢复日志直接拒绝；获取实例锁先于 Store 初始化。
 - 仅构建 Candidate：仓库根目录 `./script/build_and_run.sh --build`。它不退出或启动已有应用；默认 run 模式不属于隔离测试入口。
 - `macos-preflight.sh` 和 `macos-sysproxy-roundtrip.mjs` **仍会真实修改系统代理**，不得把它们当只读或常规 CI 验证。本轮没有运行这些脚本。
 
-本轮已在 Linux / Node 24.22.1 验证：251 项，240 通过、0 失败、11 显式跳过；`verify.sh` 的官方内核阶段因缺少二进制显式跳过。本地 Linux 没有编译/执行 Swift；远程 macOS 构建与测试以对应提交的实际 Actions 日志为准，不能由本地跳过推断通过。真实内核接管、系统代理恢复、TUN、UI 交互、macOS 13 运行或正式分发仍未验证。
+首批提交 `da548b1` 的[受限 CI](https://github.com/yingshu0218/jms/actions/runs/43040450274)已实际通过：arm64/Intel 各 41 项 Swift 测试，隔离 Node 251 项中 240 通过、11 跳过，固定内核 27 份配置检查，以及 Candidate 构建/架构/签名门禁。这只证明该提交，不代表后续整改已完成。
+
+第二批加入热切确认、Store/订阅事务、typed schema、受限 RE2/IP 校验、Swift effective 状态与严格 macOS 恢复回归。Linux 无 Swift/Xcode或指定内核；当前批次的 Swift、固定内核与新增回环流量门禁必须以同一提交的实际 CI 日志为准。真实系统代理恢复、TUN、UI 交互、macOS 13 运行与正式分发均未验证。下方历史记录不构成本批验证证据。
+
+第二批本地检查点：Linux / Node 24.22.1，`npm test` 508 项，497 通过、0 失败、11 显式跳过（真实内核10项、Linux capability1项）。58项原生Swift及10项helper测试在此环境没有执行。未提供SING_BOX时，固定内核与显式回环门禁均未验证，不得将这些缺项写成通过。
+
+### macOS 恢复事务的两个入口
+
+原生包新增不提权的 `JMSProxyPreferences` helper，使用固定服务 UUID 路径、`SCPreferencesLock`、全服务 compare-and-set、一次 Commit/Apply 与持久状态读回。原始 Proxies plist 区分不存在、空字典和已停用的旧地址，私有 IPC 与0600 journal不输出原始字典。Swift helper 测试只注入内存存储，Node 只注入 fake IPC；绝不将 CLI 的 compareAndSet 当作测试运行。
+
+缺少完整服务身份、可识别的鉴权或不支持的字典键时拒绝接管，不读 Keychain、不装 setuid/daemon。仅存在于Keychain的鉴权能否被raw字典充分识别尚未证明，不能声称覆盖全部鉴权形态。没有随包 helper 的旧源码入口仍采用严格 networksetup 事务，无法无损恢复空旧host/port时拒绝。旧schema journal不自动猜测转换。这些限制与真实 Mac 非root权限/Apply 行为必须单独验收，源码与 mock 通过不代表系统代理可用性通过。
 
 
 ## 接手开发基线（2026-10-20）

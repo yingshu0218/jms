@@ -18,6 +18,9 @@ import SwiftUI
     @Published var latency = ""
     @Published var checking = false
     @Published var routingModePending: String?
+    @Published private(set) var selectionPending: Int?
+    @Published private(set) var effectiveTrusted = false
+    @Published var switchNotice = ""
     @Published var checks = "尚未检测"
     let runtime: EngineRuntime
     init(runtime: EngineRuntime? = nil) {
@@ -26,6 +29,7 @@ import SwiftUI
             guard let self else { return }
             self.polling?.cancel(); self.events?.cancel()
             self.polling = nil; self.events = nil; self.ready = false
+            self.snapshotGate.invalidate(); self.effectiveTrusted = false
             if !self.shuttingDown { self.error = "自有引擎已退出，已停止轮询与事件重连" }
         }
     }
@@ -36,7 +40,7 @@ import SwiftUI
     private var routingTask: Task<Void, Never>?
     private var checkingTask: Task<Void, Never>?
     func start() {
-        guard polling == nil, !shuttingDown else { return }
+        guard polling == nil, !shuttingDown, !working, !checking else { return }
         startingEngine = true
         polling = Task {
             do { try await runtime.start(); try Task.checkCancellation(); ready = true; startingEngine = false }
@@ -49,70 +53,113 @@ import SwiftUI
         }
     }
     func retryEngineRecovery() {
-        guard !ready, !startingEngine, !shuttingDown else { return }
+        guard !ready, !startingEngine, !shuttingDown, !working, !checking else { return }
         error = nil; shutdownError = nil
         start()
     }
-    private var stateRevision = 0
-    func refresh() async throws {
-        let revision = stateRevision
-        let result = try await client.snapshot()
-        if revision == stateRevision { snapshot = result }
+    private var snapshotGate = SnapshotGate()
+    var canSwitch: Bool { ready && !working && !shuttingDown && snapshot?.status.busy == nil }
+    var effectiveSelection: Int? { effectiveTrusted && ready ? snapshot?.status.confirmedSelection : nil }
+    var effectiveRoutingMode: String? { effectiveTrusted && ready ? snapshot?.status.confirmedMode : nil }
+    var effectiveNodeName: String? {
+        guard effectiveTrusted, ready, snapshot?.status.running == true, snapshot?.status.effective?.selectionKnown == true else { return nil }
+        return snapshot?.status.effective?.node
+    }
+    var selectionSummary: String {
+        if selectionPending != nil || routingModePending != nil { return "正在确认切换…" }
+        guard ready else { return "引擎离线，当前状态未知" }
+        if snapshot?.status.busy == "recovering" { return "内核正在恢复，当前生效状态尚未确认" }
+        if snapshot?.status.running != true {
+            guard let snapshot else { return "正在加载状态" }
+            let index = snapshot.settings.selected
+            let name = snapshot.subscription.nodes.indices.contains(index) ? snapshot.subscription.nodes[index].name : "未选择节点"
+            return "尚未连接；下次连接：\(name) · \(snapshot.settings.routingMode)"
+        }
+        if !effectiveTrusted || snapshot?.status.effective?.known != true { return "当前生效状态尚未确认，可重新选择以重试" }
+        if let message = snapshot?.status.persistenceError { return "当前已生效，但设置未保存：" + message }
+        return switchNotice
+    }
+    func refresh(reconciling: Bool = false) async throws {
+        if working && !reconciling { return }
+        let active = client
+        let ticket = snapshotGate.issue(lease: active.lease.instanceId)
+        let result = try await active.snapshot()
+        let credentials = try active.lease.authorize()
+        guard snapshotGate.accepts(ticket, lease: runtime.instanceId), credentials.instanceId == runtime.instanceId else { return }
+        snapshot = result
+        effectiveTrusted = true
     }
     func perform(label: String = "正在执行操作", command: String = "本地引擎请求", _ action: @escaping () async throws -> Void) {
-        guard !working, !shuttingDown else { return }; working = true; workingTitle = label; workingCommand = command; workingStarted = Date()
+        guard canSwitch else { return }
+        working = true; workingTitle = label; workingCommand = command; workingStarted = Date()
+        snapshotGate.invalidate(); effectiveTrusted = false
+        let switching = selectionPending != nil || routingModePending != nil
+        if switching { switchNotice = "正在确认本次切换…" }
+        let launch = runtime.instanceId
         mutationTask = Task {
-            defer { working = false; mutationTask = nil }
-            do {
-                try await action()
-                stateRevision += 1
-                working = false
-                Task { do { try await self.refresh() } catch { self.error = error.localizedDescription } }
-            }
+            defer { working = false; mutationTask = nil; selectionPending = nil; routingModePending = nil }
+            var requestFailed = false
+            do { try await action() }
             catch {
-                if (error as? APIError)?.code == "NEED_ELEVATION" { self.showTunPermission = true }
-                else { self.error = error.localizedDescription }
+                requestFailed = true
+                if launch == runtime.instanceId {
+                    if switching { switchNotice = "本次切换请求失败，结果尚待确认" }
+                    if (error as? APIError)?.code == "NEED_ELEVATION" { self.showTunPermission = true }
+                    else { self.error = error.localizedDescription }
+                }
+            }
+            snapshotGate.invalidate()
+            guard launch == runtime.instanceId else {
+                if switching { switchNotice = "引擎会话已变化，本次切换结果未知，请重新确认" }
+                return
+            }
+            do {
+                try await refresh(reconciling: true)
+                if switching && requestFailed {
+                    switchNotice = effectiveTrusted && snapshot?.status.effective?.known == true
+                        ? "本次切换请求失败，当前生效状态已重新确认；保存结果未确认，可重试"
+                        : "本次切换结果未知，可重新确认或重试"
+                }
+            } catch {
+                effectiveTrusted = false; self.error = error.localizedDescription
+                if switching { switchNotice = "本次切换结果未知，可重新确认或重试" }
             }
         }
     }
     func post(_ path: String, _ body: [String: Any] = [:]) {
-        if path == "api/routing-mode", let mode = body["mode"] as? String {
-            setRoutingMode(mode)
-            return
-        }
+        if path == "api/routing-mode", let mode = body["mode"] as? String { setRoutingMode(mode); return }
+        if path == "api/node", let index = body["index"] as? Int { setNode(index); return }
         perform(label: path == "api/connect" ? "正在连接代理" : path == "api/disconnect" ? "正在恢复系统网络设置" : "正在执行操作", command: "POST /" + path) {
             let data = try await self.client.request(path, body: body)
-            if path == "api/node", let index = body["index"] as? Int, let count = self.snapshot?.subscription.nodes.count, (0..<count).contains(index) {
-                self.snapshot?.settings.selected = index
-            }
             if let result = try JSONSerialization.jsonObject(with: data) as? [String: Any], let reason = result["reason"] as? String {
                 self.logs.append(reason)
                 if self.snapshot?.status.running == true { self.error = reason }
             }
         }
     }
-    func setRoutingMode(_ mode: String) {
-        guard ready, !shuttingDown, !working, routingModePending == nil,
-              ["rule", "global", "direct"].contains(mode), snapshot?.settings.routingMode != mode else { return }
-        routingModePending = mode
-        stateRevision += 1
-        routingTask = Task {
-            defer { routingModePending = nil; routingTask = nil }
-            do {
-                let data = try await client.request("api/routing-mode", body: ["mode": mode])
-                let result = try JSONSerialization.jsonObject(with: data) as? [String: Any]
-                snapshot?.settings.routingMode = mode
-                stateRevision += 1
-                if let reason = result?["reason"] as? String {
-                    logs.append(reason)
-                    if snapshot?.status.running == true { error = reason }
-                }
-                Task { try? await self.refresh() }
-            } catch {
-                stateRevision += 1
-                self.error = error.localizedDescription
-            }
+    private func switchValue(path: String, body: [String: Any]) {
+        let active = client
+        let launch = runtime.instanceId
+        perform(label: "正在确认切换", command: "POST /" + path) {
+            let data = try await active.request(path, body: body)
+            guard launch == self.runtime.instanceId else { return }
+            _ = try active.lease.authorize()
+            let result = try JSONDecoder().decode(HotSwitchResult.self, from: data)
+            self.switchNotice = result.summary
+            if !result.applied || !result.persisted { self.logs.append(result.summary) }
+            // Desired settings and current selection are never guessed from the request.
+            // A fresh, authenticated snapshot reconciles both success and failure.
         }
+    }
+    func setNode(_ index: Int) {
+        guard canSwitch, let count = snapshot?.subscription.nodes.count, (0..<count).contains(index) else { return }
+        selectionPending = index
+        switchValue(path: "api/node", body: ["index": index])
+    }
+    func setRoutingMode(_ mode: String) {
+        guard canSwitch, ["rule", "global", "direct"].contains(mode) else { return }
+        routingModePending = mode
+        switchValue(path: "api/routing-mode", body: ["mode": mode])
     }
     func settings(_ patch: [String: Any]) { post("api/settings", ["settings": patch]) }
     func toggleConnection() { post(snapshot?.status.connected == true ? "api/disconnect" : "api/connect") }
@@ -145,7 +192,7 @@ import SwiftUI
             let data = try await self.client.request("api/linkcheck", body: [:])
             let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:]
             let results = json["results"] as? [[String: Any]] ?? []
-            let via = json["via"] as? String == "proxy" ? "代理链路" : "直连（未验证代理）"
+            let via = json["via"] as? String == "proxy" ? (json["routeScope"] as? String == "selected-node" ? "指定节点链路（独立于业务分流）" : "本地代理入口（按当前路由，未必经过远端节点）") : "直连（未验证代理）"
             let summary = json["summary"] as? [String: Any] ?? [:]
             let conclusion = json["via"] as? String == "proxy" ? "\(summary["verdict"] ?? "")" : "\(results.filter { $0["ok"] as? Bool == true }.count)/\(results.count) 个站点直连可达，本次未验证代理链路。"
             self.checks = "检测方式：\(via)\n\(conclusion)\n\n" + results.map { r in
@@ -166,6 +213,7 @@ import SwiftUI
                 var kind = "message"
                 for try await line in bytes.lines {
                     if Task.isCancelled { return }
+                    try activeClient.lease.validate(request)
                     if line.hasPrefix("event: ") { kind = String(line.dropFirst(7)) }
                     if line.hasPrefix("data: ") {
                         let value = String(line.dropFirst(6))

@@ -157,7 +157,7 @@ export function buildTunPerAppConfig(nodes, opts = {}) {
     { process_name: processNames, ip_is_private: true, outbound: 'direct' },
 
     // ⑤ 规则档才做国内直连；global / direct 档由上面的守卫接管
-    ...(routingMode === 'rule' && directRules
+    ...(directRules
       ? [...(ruleSetPaths['geoip-cn'] ? [{ process_name: processNames, ...cnMatch, outbound: 'direct' }, { process_name: processNames, action: 'resolve' }] : []), ruleSetPaths['geoip-cn']
           ? { process_name: processNames, rule_set: 'geoip-cn', outbound: 'direct' }
           : { process_name: processNames, domain_suffix: FALLBACK_CN_SUFFIXES, outbound: 'direct' }]
@@ -189,6 +189,11 @@ export function buildTunPerAppConfig(nodes, opts = {}) {
     dns.rules = [];
   }
 
+  // mixed-in 是节点诊断专用入口，不携带原始应用身份。它必须绕过应用、
+  // 模式及自定义直连规则，失败只能体现为代理失败，不能被直连成功掩盖。
+  rules.unshift({ inbound: ['mixed-in'], outbound: SELECTOR_TAG });
+  dns.rules.unshift({ inbound: ['mixed-in'], server: 'remote' });
+
   // rule_set 在 route 下统一声明；DNS 规则引用了 geosite-cn，所以即便路由规则没用它也要声明
   const ruleSet = [];
   if (ruleSetPaths['geoip-cn']) {
@@ -202,7 +207,7 @@ export function buildTunPerAppConfig(nodes, opts = {}) {
     log: { level: 'info', timestamp: true },
     dns,
     experimental: {
-      clash_api: { external_controller: clashApi },
+      clash_api: { external_controller: clashApi, default_mode: routingMode },
       cache_file: { enabled: true },
     },
     inbounds: [

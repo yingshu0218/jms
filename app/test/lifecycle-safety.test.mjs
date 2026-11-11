@@ -15,7 +15,7 @@ function setup(t) {
   const dir = mkdtempSync(join(tmpdir(), 'jms-lifecycle-'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const adapter = new MockAdapter({ mode: 'on', host: 'corp.example', port: 3128 });
-  const app = new AppService({ dir, adapter, coreBinary: '/fixture-only/not-an-executable', portsAvailable: async () => {}, ruleSetProvider: async () => ({}) });
+  const app = new AppService({ dir, adapter, coreBinary: '/fixture-only/not-an-executable', portsAvailable: async () => {}, ruleSetProvider: async () => ({}), clashApiFactory: () => ({ setMode: async()=>{}, getMode: async()=> 'rule', select: async()=>{}, currentSelection: async()=> app.nodeTags()[app.sessionSettings?.selected ?? 0] }) });
   app.store.write({ subscription: { nodes: parseSubscription(SAMPLE_PLAIN).nodes } });
   return { app, adapter };
 }
@@ -66,6 +66,26 @@ test('崩溃放弃：待生效模式改成TUN仍按journal恢复旧sysproxy', as
   assert.equal(app.journal.isPending(), false);
   assert.equal(adapter.state.host, 'corp.example');
   assert.equal(adapter.state.port, 3128);
+});
+
+test('崩溃放弃恢复与前台交易串行，不并发清除恢复日志', async t => {
+  const {app,adapter}=setup(t);const supervisor=new FakeSupervisor();app.supervisorFactory=()=>supervisor;
+  await app.connect();app.busy='fixture-foreground';supervisor.running=false;
+  const recovered=once(app,'gaveup');supervisor.emit('giveup',{restarts:5});
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(app.journal.isPending(),true);assert.equal(adapter.state.host,'127.0.0.1');
+  app.busy=null;await recovered;
+  assert.equal(app.journal.isPending(),false);assert.equal(adapter.state.host,'corp.example');assert.equal(app.busy,null);
+});
+
+test('等候中的旧giveup不能恢复或清除新supervisor的日志', async t => {
+  const {app,adapter}=setup(t);const supervisor=new FakeSupervisor();app.supervisorFactory=()=>supervisor;
+  await app.connect();app.busy='fixture-foreground';supervisor.running=false;
+  const original=readFileSync(app.journal.file,'utf8');supervisor.emit('giveup',{restarts:5});
+  app.supervisor=new FakeSupervisor();app.busy=null;
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(readFileSync(app.journal.file,'utf8'),original);assert.equal(adapter.state.host,'127.0.0.1');
+  await app.disconnect();
 });
 
 test('恢复：损坏/无效journal不能被当作缺失，更不能关闭用户原代理', async t => {

@@ -38,9 +38,9 @@ test('★ 规则模式：模式守卫在最前、国内直连、其余走代理'
   assert.equal(cfg.route.final, SELECTOR_TAG, '兜底走代理');
 });
 
-test('★ 全局模式：不再有国内直连规则，兜底仍走代理', () => {
+test('★ 全局模式：保留国内规则供热切，运行时全局守卫优先', () => {
   const cfg = buildConfig(nodes(), { routingMode: 'global', ruleSetPaths: { 'geoip-cn': '/x/geoip-cn.srs' } });
-  assert.ok(!cfg.route.rules.some((x) => x.rule_set === 'geoip-cn'), '全局档不该再单独放行国内地址');
+  assert.ok(cfg.route.rules.some((x) => x.rule_set === 'geoip-cn'), '必须保留热切规则档所需规则');
   assert.equal(cfg.route.final, SELECTOR_TAG);
   const g = cfg.route.rules.find((x) => x.clash_mode === 'global');
   assert.equal(g.outbound, SELECTOR_TAG);
@@ -81,7 +81,7 @@ test('DNS：没有 geosite 规则集时退回内置后缀兜底', () => {
 
 test('★ DNS：直连档全部本地解析（一个跨境 DNS 都不该有）', () => {
   const dns = buildDnsConfig({ routingMode: 'direct', ruleSetPaths: {} });
-  assert.equal(dns.final, 'local');
+  assert.equal(dns.final, 'remote', '直连档靠运行时守卫，不改变热切兜底');
   assert.equal(dns.rules.find((x) => x.clash_mode === 'direct').server, 'local');
 });
 

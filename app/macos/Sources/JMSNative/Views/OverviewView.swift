@@ -22,7 +22,7 @@ struct OverviewView: View {
                         .frame(width: 42, height: 48)
                     VStack(alignment: .leading, spacing: 5) {
                         Text(connected ? "代理已连接" : "尚未连接").font(.title3.weight(.semibold))
-                        Text(model.snapshot?.status.node ?? "添加订阅后选择一个节点").foregroundStyle(.secondary).lineLimit(1)
+                        Text(model.effectiveNodeName ?? (connected ? "当前节点未确认" : "添加订阅后选择一个节点")).foregroundStyle(.secondary).lineLimit(1)
                     }
                     Spacer(minLength: 6)
                     Button(connected ? "断开连接" : "连接代理") { model.toggleConnection() }
@@ -45,10 +45,15 @@ struct OverviewView: View {
             if let settings = model.snapshot?.settings {
                 GroupBox {
                     PreferenceRow(title: "路由模式") {
-                        Picker("路由模式", selection: Binding(get: { model.routingModePending ?? settings.routingMode }, set: { model.setRoutingMode($0) })) {
-                            Text("规则").tag("rule"); Text("全局").tag("global"); Text("直连").tag("direct")
-                        }.labelsHidden().pickerStyle(.segmented).frame(width: 230).allowsHitTesting(model.routingModePending == nil)
+                        HStack {
+                            ForEach([("rule", "规则"), ("global", "全局"), ("direct", "直连")], id: \.0) { item in
+                                Button((model.effectiveRoutingMode == item.0 ? "✓ " : "") + item.1) { model.setRoutingMode(item.0) }
+                                    .disabled(!model.canSwitch)
+                            }
+                        }
+
                     }
+                    Text(model.selectionSummary).font(.caption).foregroundStyle(.secondary)
                     Divider()
                     PreferenceRow(title: "接管方式", subtitle: "修改后重新连接生效") {
                         Picker("接管方式", selection: Binding(get: { settings.mode }, set: { model.settings(["mode": $0]) })) {

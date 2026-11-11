@@ -9,8 +9,8 @@
 // 做法：在**改动系统设置之前**先把原始状态落盘；正常断开时清除；
 // 下次启动时若发现这份日志还在，说明上次没走完流程 —— 立刻还原。
 
-import { readFileSync, writeFileSync, renameSync, chmodSync, rmSync, existsSync } from 'node:fs';
-import { join } from 'node:path';
+import { readFileSync, writeFileSync, renameSync, chmodSync, rmSync, existsSync, openSync, closeSync, fsyncSync } from 'node:fs';
+import { join, dirname } from 'node:path';
 
 export class ProxyJournal {
   constructor(dir) {
@@ -27,7 +27,8 @@ export class ProxyJournal {
     }
     try {
       const entry = JSON.parse(text);
-      if (!entry || typeof entry !== 'object' || Array.isArray(entry) ||
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry) || entry.version !== 2 ||
+          !['darwin', 'win32', 'linux'].includes(entry.platform) ||
           !entry.previous || !['on', 'off'].includes(entry.previous.mode) ||
           (entry.previous.mode === 'on' && (typeof entry.previous.host !== 'string' || !entry.previous.host ||
             !Number.isInteger(entry.previous.port) || entry.previous.port < 1 || entry.previous.port > 65535)) ||
@@ -41,25 +42,42 @@ export class ProxyJournal {
   }
 
   /** 改动系统设置**之前**调用 */
-  begin({ platform, previous, previousBase, target }) {
+  begin({ platform, previous, previousBase, target, darwin }) {
     if (this.isPending()) throw recoveryError();
     const payload = {
+      version: 2,
       platform,
       previous: previous ?? { mode: 'off' },
       // 完整快照：多网卡 / 多注册表项的精确还原全靠它
       previousBase: previousBase ?? null,
       target,
+      ...(darwin ? { darwin } : {}),
       startedAt: new Date().toISOString(),
       pid: process.pid,
     };
-    writeFileSync(this.tmp, JSON.stringify(payload, null, 2), { mode: 0o600 });
-    try {
-      chmodSync(this.tmp, 0o600);
-    } catch {
-      /* ignore */
-    }
-    renameSync(this.tmp, this.file);
+    this.#persist(payload);
     return payload;
+  }
+
+  /** Persist each Darwin command's possible effects before it can run. */
+  updateDarwin(darwin) {
+    const entry = this.read();
+    if (!entry || entry.platform !== 'darwin' || entry.version !== 2) throw recoveryError();
+    const payload = { ...entry, darwin };
+    this.#persist(payload);
+    return payload;
+  }
+
+  #persist(payload) {
+    writeFileSync(this.tmp, JSON.stringify(payload, null, 2), { mode: 0o600 });
+    chmodSync(this.tmp, 0o600);
+    const fd = openSync(this.tmp, 'r');
+    try { fsyncSync(fd); } finally { closeSync(fd); }
+    renameSync(this.tmp, this.file);
+    if (payload.platform === 'darwin') {
+      const directory = openSync(dirname(this.file), 'r');
+      try { fsyncSync(directory); } finally { closeSync(directory); }
+    }
   }
 
   /** 成功断开、或自愈完成后调用 */

@@ -40,7 +40,7 @@ test('判定：全部可达 → ok', () => {
   ]);
   assert.equal(s.level, 'ok');
   assert.equal(s.ok, 2);
-  assert.match(s.verdict, /全部可达/);
+  assert.match(s.verdict, /成功 HTTP/);
 });
 
 test('★ 判定：对照组也不通 → 判为隧道问题（这是最有价值的一条结论）', () => {
@@ -53,7 +53,7 @@ test('★ 判定：对照组也不通 → 判为隧道问题（这是最有价�
   assert.match(s.verdict, /隧道/);
 });
 
-test('判定：对照组通、目标站全不通 → 指向出口 IP 被识别', () => {
+test('判定：对照组成功、目标站未成功仍不确定单一根因', () => {
   const s = summarize([
     { id: 'a', label: 'Google', group: 'blocked', ok: false, error: '超时' },
     { id: 'b', label: 'YouTube', group: 'blocked', ok: false, error: '超时' },
@@ -61,7 +61,7 @@ test('判定：对照组通、目标站全不通 → 指向出口 IP 被识别',
   ]);
   assert.equal(s.level, 'warn');
   assert.deepEqual(s.failedLabels, ['Google', 'YouTube']);
-  assert.match(s.verdict, /出口 IP/);
+  assert.match(s.verdict, /目标策略/);
 });
 
 test('判定：空目标列表不应崩', () => {
@@ -81,10 +81,12 @@ test('探测：直连本地 HTTP 服务拿到状态码', async () => {
   });
 });
 
-test('探测：404 也算可达 —— 判定的是"能不能连上"，不是 HTTP 语义', async () => {
+test('探测：404虽HTTP可达但服务未成功', async () => {
   await withLocalServer(async (port) => {
     const r = await probe(`http://127.0.0.1:${port}/nope`);
-    assert.equal(r.ok, true);
+    assert.equal(r.ok, false);
+    assert.equal(r.reachable, true);
+    assert.equal(r.serviceAvailable, false);
     assert.equal(r.status, 404);
   });
 });
@@ -171,7 +173,7 @@ test('检测：并发执行且保持输入顺序', async () => {
   assert.ok(order.length === DEFAULT_TARGETS.length);
 });
 
-test('★ 诊断：代理失败但直连可达 → 指向隧道/出口问题', async () => {
+test('★ 诊断：代理未成功但直连成功仅作路径比较，不断言根因', async () => {
   const fakeProbe = async (url, { proxy }) => {
     if (proxy) return { ok: false, error: '超时', latencyMs: 8000 };
     return { ok: true, status: 200, latencyMs: 30 };
@@ -184,17 +186,25 @@ test('★ 诊断：代理失败但直连可达 → 指向隧道/出口问题', a
   const r = out.results[0];
   assert.equal(r.ok, false);
   assert.equal(r.direct.ok, true);
-  assert.match(r.diagnosis, /隧道或出口节点/);
+  assert.match(r.diagnosis, /尚不能定位/);
 });
 
-test('诊断：代理和直连都失败 → 明确"与代理无关"', async () => {
+test('代理403与直连200不等于隧道故障', async () => {
+  const out=await runLinkCheck({proxy:{host:'127.0.0.1',port:1},targets:[{id:'fixture',url:'https://fixture.invalid/',group:'control'}],
+    probeImpl:async(_url,{proxy})=>({ok:!proxy,status:proxy?403:200,reachable:true,serviceAvailable:!proxy,latencyMs:1})});
+  assert.match(out.results[0].diagnosis,/目标策略/);
+  assert.doesNotMatch(out.results[0].diagnosis,/问题在|隧道.*故障/);
+  assert.match(out.summary.verdict,/未返回成功/);
+});
+
+test('诊断：代理和直连都失败不能排除代理问题', async () => {
   const fakeProbe = async () => ({ ok: false, error: '超时', latencyMs: 8000 });
   const out = await runLinkCheck({
     proxy: { host: '127.0.0.1', port: 2080 },
     targets: [{ id: 'x', label: 'X', url: 'https://x.com/', group: 'blocked' }],
     probeImpl: fakeProbe,
   });
-  assert.match(out.results[0].diagnosis, /与代理无关/);
+  assert.match(out.results[0].diagnosis, /不能排除代理/);
   assert.equal(out.summary.level, 'bad'); // 没有对照组 → 全失败判为 bad
 });
 

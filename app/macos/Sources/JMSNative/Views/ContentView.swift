@@ -69,7 +69,7 @@ struct ContentView: View {
             if !model.ready {
                 Button("重新启动并恢复") { model.retryEngineRecovery() }
                     .help("启动自有引擎，按恢复日志恢复网络设置；不会强杀进程或直接删除恢复日志")
-                    .disabled(model.startingEngine || model.shuttingDown || model.working)
+                    .disabled(model.startingEngine || model.shuttingDown || model.working || model.checking)
             }
             Button(model.snapshot?.status.connected == true ? "断开" : "连接", systemImage: "power") { model.toggleConnection() }.labelStyle(.titleAndIcon).help("连接或断开代理").disabled(!model.ready || model.working)
             }

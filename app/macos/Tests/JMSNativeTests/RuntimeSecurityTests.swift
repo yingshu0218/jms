@@ -200,6 +200,7 @@ final class RuntimeSecurityTests: XCTestCase {
     }
     @MainActor func testShutdownWaitsForMutationAndBlocksNewWork() async {
         let model = AppModel(runtime: EngineRuntime(client: client()))
+        model.ready = true
         let started = expectation(description: "mutation started")
         var release: CheckedContinuation<Void, Never>?
         model.perform {

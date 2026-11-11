@@ -20,7 +20,7 @@ export const CUSTOM_RULE_TYPES = [
   { type: 'domain', label: '精确域名', hint: '例：example.com' },
   { type: 'domain_suffix', label: '域名后缀', hint: '例：.example.com' },
   { type: 'domain_keyword', label: '域名关键词', hint: '例：analytics' },
-  { type: 'domain_regex', label: '域名正则', hint: '例：^.+\\.example\\.com$' },
+  { type: 'domain_regex', label: '域名正则', hint: '受限 RE2 子集（不支持断言/反向引用）；例：^.+\\.example\\.com$' },
   { type: 'ip_cidr', label: 'IP 网段', hint: '例：10.0.0.0/8' },
   { type: 'process_name', label: '进程名', hint: '例：Postman.exe' },
   { type: 'process_path', label: '进程路径', hint: '例：/usr/bin/curl' },
@@ -29,30 +29,112 @@ export const CUSTOM_RULE_TYPES = [
 const TYPE_SET = new Set(CUSTOM_RULE_TYPES.map((t) => t.type));
 const OUTBOUND_LABEL = { [SELECTOR_TAG]: 'proxy', direct: 'direct' };
 
+// Pure literal validation: no DNS, interfaces or platform-dependent parsing.
+function ipv4(value) {
+  const parts = value.split('.');
+  return parts.length === 4 && parts.every(p => /^(0|[1-9][0-9]{0,2})$/.test(p) && Number(p) <= 255);
+}
+function ipBits(value) {
+  if (ipv4(value)) return 32;
+  if (!value.includes(':') || !/^[0-9a-fA-F:.]+$/.test(value)) return 0;
+  let text = value;
+  if (text.includes('.')) {
+    const index = text.lastIndexOf(':');
+    if (!ipv4(text.slice(index + 1))) return 0;
+    text = text.slice(0, index + 1) + '0:0';
+  }
+  const halves = text.split('::');
+  if (halves.length > 2) return 0;
+  const groups = halves.flatMap(h => h ? h.split(':') : []);
+  if (!groups.every(g => /^[0-9a-fA-F]{1,4}$/.test(g))) return 0;
+  return (halves.length === 2 ? groups.length < 8 : groups.length === 8) ? 128 : 0;
+}
+
+// Deliberately restricted RE2 syntax, NOT a JavaScript-to-RE2 equivalence claim.
+// Permit ordinary groups/classes/quantifiers, Go flags and named captures. Reject
+// everything outside this subset. The fixed sing-box config check remains final.
+function validateRegexSubset(value) {
+  let translated = '';
+  let inClass = false;
+  for (let i = 0; i < value.length; i++) {
+    const c = value[i];
+    if (c === '\\') {
+      const next = value[++i];
+      if (!next) throw new Error('末尾反斜杠');
+      if ('Az'.includes(next) && !inClass) { translated += next === 'A' ? '^' : '$'; continue; }
+      if (inClass && 'bB'.includes(next)) throw new Error('字符类内不支持词边界');
+      if ('dDsSwWbBfnrt'.includes(next) || '\\.^$|?*+()[]{}-'.includes(next)) {
+        // JS unicode mode disallows escaped '-' outside a class; literal is safe.
+        translated += next === '-' && !inClass ? '-' : '\\' + next;
+        continue;
+      }
+      if (next === 'x' && /^[0-9a-fA-F]{2}/.test(value.slice(i + 1))) {
+        translated += value.slice(i - 1, i + 3); i += 2; continue;
+      }
+      throw new Error(`不支持转义 \\${next}（含反向引用、Unicode/八进制转义）`);
+    }
+    if (c === '[' && !inClass) {
+      if (/^\[\^?\]/.test(value.slice(i))) throw new Error('空字符类不受支持');
+      inClass = true; translated += c; continue;
+    }
+    if (c === ']' && inClass) { inClass = false; translated += c; continue; }
+    if (inClass) {
+      if (c === '[') throw new Error('暂不支持 POSIX 字符类或嵌套字符类');
+      translated += c; continue;
+    }
+    if (c === '(' && value[i + 1] === '?') {
+      const suffix = value.slice(i);
+      const named = /^\(\?(?:P)?<([A-Za-z_][A-Za-z0-9_]*)>/.exec(suffix);
+      const flags = /^\(\?([imsU]+(?:-[imsU]+)?|-[imsU]+)([:)])/.exec(suffix);
+      if (named) { translated += '('; i += named[0].length - 1; continue; }
+      if (flags) {
+        translated += flags[2] === ':' ? '(?:' : '(?:)';
+        i += flags[0].length - 1; continue;
+      }
+      if (suffix.startsWith('(?:')) { translated += '(?:'; i += 2; continue; }
+      throw new Error('不支持断言、递归、条件、原子组等扩展');
+    }
+    if (c === '{') {
+      const count = /^\{(\d+)(?:,(\d*))?\}/.exec(value.slice(i));
+      if (!count || Number(count[1]) > 1000 || (count[2] && Number(count[2]) > 1000))
+        throw new Error('重复次数须为 0–1000，字面花括号需要转义');
+    }
+    translated += c;
+  }
+  // Secondary structural check only, after the explicit subset filter above.
+  new RegExp(translated, 'u');
+}
+
 /** 校验单条规则，返回 { rule } 或 { error } */
 export function validateCustomRule(input) {
-  if (!input || typeof input !== 'object') return { error: '规则不是对象' };
-  const type = String(input.type ?? '').trim();
-  const value = String(input.value ?? '').trim();
-  const outbound = String(input.outbound ?? 'proxy').trim();
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return { error: '规则不是对象' };
+  for (const key of ['type', 'value']) {
+    if (typeof input[key] !== 'string') return { error: `${key} 必须是字符串` };
+  }
+  for (const key of ['outbound', 'id']) {
+    if (key in input && typeof input[key] !== 'string') return { error: `${key} 必须是字符串` };
+  }
+  if ('enabled' in input && typeof input.enabled !== 'boolean') return { error: 'enabled 必须是布尔值' };
+  const type = input.type.trim();
+  const value = input.value.trim();
+  const outbound = (input.outbound ?? 'proxy').trim();
 
   if (!TYPE_SET.has(type)) return { error: `不支持的匹配类型: ${type || '(空)'}` };
   if (!value) return { error: '匹配内容不能为空' };
   if (value.length > 512) return { error: '匹配内容过长（上限 512 字符）' };
   if (outbound !== 'proxy' && outbound !== 'direct') return { error: `出站只能是 proxy 或 direct，收到 ${outbound}` };
 
-  // 正则类规则先在本地编译一次，避免把坏正则交给内核（内核报错会导致启动失败）
   if (type === 'domain_regex') {
-    try {
-      new RegExp(value);
-    } catch (e) {
-      return { error: `正则表达式无效：${e.message}` };
-    }
+    try { validateRegexSubset(value); }
+    catch (e) { return { error: `正则表达式无效或超出受限 RE2 子集：${e.message}` }; }
   }
-  // IP 网段做一次粗校验
   if (type === 'ip_cidr') {
-    const ok = /^[0-9a-fA-F:.]+\/\d{1,3}$/.test(value) || /^[0-9a-fA-F:.]+$/.test(value);
-    if (!ok) return { error: `IP 网段格式可疑：${value}（例：10.0.0.0/8）` };
+    const parts = value.split('/');
+    const bits = ipBits(parts[0]);
+    if (!bits || parts.length > 2 || (parts.length === 2 &&
+        (!/^(0|[1-9][0-9]{0,2})$/.test(parts[1]) || Number(parts[1]) > bits))) {
+      return { error: `IP 网段无效：${value}（IPv4 前缀 0–32，IPv6 前缀 0–128）` };
+    }
   }
   // 域名关键词不该带通配符（这是常见误用）
   if (type === 'domain' && value.includes('*')) {
@@ -61,7 +143,7 @@ export function validateCustomRule(input) {
 
   return {
     rule: {
-      id: String(input.id ?? '').trim() || `${type}:${value}:${outbound}`,
+      id: (input.id ?? '').trim() || `${type}:${value}:${outbound}`,
       type,
       value,
       outbound,

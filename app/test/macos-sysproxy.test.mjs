@@ -28,21 +28,22 @@ const SVC_ORDER = `An asterisk (*) denotes that a network service is disabled.
 `;
 
 const SNAP = {
+  schema: 2,
   services: [
     {
-      name: 'Wi-Fi',
-      webproxy: { enabled: true, host: 'corp.proxy', port: 8080 },
-      securewebproxy: { enabled: true, host: 'corp.proxy', port: 8080 },
-      socksfirewallproxy: { enabled: false, host: null, port: null },
+      id: '11111111-1111-4111-8111-111111111111', device: 'en0', name: 'Wi-Fi',
+      webproxy: { enabled: true, authenticated: false, host: 'corp.proxy', port: 8080 },
+      securewebproxy: { enabled: true, authenticated: false, host: 'corp.proxy', port: 8080 },
+      socksfirewallproxy: { enabled: false, authenticated: false, host: 'stored.example', port: 3128 },
       bypass: ['*.corp.com'],
       autoproxy: { url: 'http://pac.corp/proxy.pac', enabled: true },
       autodiscovery: true,
     },
     {
-      name: 'Thunderbolt Bridge',
-      webproxy: { enabled: false, host: null, port: null },
-      securewebproxy: { enabled: false, host: null, port: null },
-      socksfirewallproxy: { enabled: true, host: '10.0.0.9', port: 1080 },
+      id: '22222222-2222-4222-8222-222222222222', device: 'bridge0', name: 'Thunderbolt Bridge',
+      webproxy: { enabled: false, authenticated: false, host: 'stored.example', port: 3128 },
+      securewebproxy: { enabled: false, authenticated: false, host: 'stored.example', port: 3128 },
+      socksfirewallproxy: { enabled: true, authenticated: false, host: '10.0.0.9', port: 1080 },
       bypass: [],
       autoproxy: { url: null, enabled: false },
       autodiscovery: false,
@@ -93,8 +94,8 @@ test('macOS：还原必须把用户原来的 PAC 地址和启用状态都写回�
   const steps = planDarwin({ mode: 'restore', base: SNAP });
   const f = flat(steps);
   assert.ok(
-    f.some((a) => a.includes('-setautoproxyurl Wi-Fi http://pac.corp/proxy.pac')),
-    '不能把公司的 PAC 弄丢',
+    !f.some((a) => a.includes('-setautoproxyurl')),
+    '接管未修改PAC URL，恢复也不重写URL',
   );
   assert.ok(f.some((a) => a === '-setautoproxystate Wi-Fi on'), '原本是开着的，还原后也要开着');
 });
@@ -140,7 +141,7 @@ test('macOS：三个协议都设 —— mixed 入站同时接受 HTTP 与 SOCKS�
 test('macOS：还原不能把端口写成我们的端口', () => {
   const steps = planDarwin({ mode: 'restore', base: SNAP });
   const f = flat(steps);
-  assert.ok(f.some((a) => a === '-setsocksfirewallproxy Thunderbolt Bridge 10.0.0.9 1080'));
+  assert.ok(f.some((a) => a === '-setsocksfirewallproxy Thunderbolt Bridge 10.0.0.9 1080 off'));
   assert.ok(!f.some((a) => a.includes('10.0.0.9 2080')));
 });
 
@@ -155,13 +156,12 @@ test('macOS：还原与开启都必须覆盖全部网卡，不能只动第一张
 });
 
 test('macOS：还原缺快照要报错', () => {
-  assert.throws(() => planDarwin({ mode: 'restore', base: null }), /需要快照/);
-  assert.throws(() => planDarwin({ mode: 'restore', base: { services: [] } }), /需要快照/);
+  assert.throws(() => planDarwin({ mode: 'restore', base: null }), /快照/);
+  assert.throws(() => planDarwin({ mode: 'restore', base: { services: [] } }), /快照/);
 });
 
-test('macOS：没有网卡时开启不报错，只是什么都不做', () => {
-  const steps = planDarwin({ mode: 'on', host: '127.0.0.1', port: 2080, base: { services: [] } });
-  assert.deepEqual(steps, []);
+test('macOS：没有完整网卡快照时拒绝生成写计划', () => {
+  assert.throws(() => planDarwin({ mode: 'on', host: '127.0.0.1', port: 2080, base: { services: [] } }), /快照/);
 });
 
 // ── 权限错误识别 ─────────────────────────────────────────────────────
@@ -218,15 +218,12 @@ test('macOS：排除没有设备的 Network Extension 服务，保留可配置�
  const order=SVC_ORDER+'\n(4) VPN node\n(Hardware Port: net.example.vpn, Device: )\n';
  assert.deepEqual(macProxyServices(['Wi-Fi','VPN node','iPhone USB'],order),['Wi-Fi','iPhone USB']);
 });
-test('启用代理把完整网卡快照交给适配器，失败时按完整快照还原', async t => {
+test('Darwin 接管拒绝不能提供持久化事务及读回校验的旧适配器', async () => {
  const { enableProxy }=await import('../engine/sysproxy/index.mjs');
- const calls=[];let fail=false;
- const adapter={platform:'darwin',snapshot:async()=>({mode:'off',base:SNAP}),apply:async target=>{calls.push(planDarwin(target));if(fail)throw Error('write failed');},restore:async base=>{calls.push({restore:base});}};
- const journal={begin:async()=>{},clear:()=>{calls.push('clear');}};
- await enableProxy({adapter,journal,port:2080});
- assert.ok(calls[0].length>0);assert.ok(calls[0].some(step=>step.args.includes('2080')));
- fail=true;await assert.rejects(()=>enableProxy({adapter,journal,port:2080}),/设置系统代理失败/);
- assert.deepEqual(calls.at(-2),{restore:SNAP});assert.equal(calls.at(-1),'clear');
+ let writes=0;
+ const adapter={platform:'darwin',snapshot:async()=>({mode:'off',base:SNAP}),apply:async()=>{writes++;}};
+ await assert.rejects(()=>enableProxy({adapter,journal:{begin:async()=>{}},port:2080}),/完整事务/);
+ assert.equal(writes,0);
 });
 
 test('macOS：读取实际生效的系统代理，可识别 VPN 覆盖与 HTTPS 不一致', async () => {
@@ -237,4 +234,18 @@ test('macOS：读取实际生效的系统代理，可识别 VPN 覆盖与 HTTPS 
  assert.equal(await isPointingAtUs({adapter:{read:async()=>effective},port:2080}),false);
  effective.https.port=2080;assert.equal(await isPointingAtUs({adapter:{read:async()=>effective},port:2080}),true);
  assert.equal(parseMacEffectiveProxy('<dictionary> {}').mode,'off');
+});
+
+test('Darwin 所有apply/restore写命令均必选，不允许吞掉失败', () => {
+ for (const mode of ['on','restore']) {
+  const steps=planDarwin({mode,host:'127.0.0.1',port:2080,base:SNAP});
+  assert.ok(steps.length>0);assert.ok(steps.every(step=>step.optional!==true));
+ }
+});
+test('Darwin 还原disabled协议仍恢复原存储地址与端口，且拒绝缺认证字段', () => {
+ const steps=flat(planDarwin({mode:'restore',base:SNAP}));
+ assert.ok(steps.includes('-setsocksfirewallproxy Wi-Fi stored.example 3128 off'));
+ assert.ok(steps.includes('-setsocksfirewallproxystate Wi-Fi off'));
+ const incomplete=structuredClone(SNAP);delete incomplete.services[0].webproxy.authenticated;
+ assert.throws(()=>planDarwin({mode:'on',host:'127.0.0.1',port:2080,base:incomplete}),/快照/);
 });

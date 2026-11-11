@@ -38,7 +38,7 @@ test('规则校验：非法输入必须给出可读原因（不能静默丢弃�
     [{ type: 'domain', value: 'x'.repeat(600), outbound: 'proxy' }, /过长/],
     [{ type: 'domain', value: 'a.com', outbound: 'sideways' }, /出站只能是/],
     [{ type: 'domain_regex', value: '([', outbound: 'proxy' }, /正则表达式无效/],
-    [{ type: 'ip_cidr', value: 'not-an-ip', outbound: 'proxy' }, /IP 网段格式可疑/],
+    [{ type: 'ip_cidr', value: 'not-an-ip', outbound: 'proxy' }, /IP 网段无效/],
     [{ type: 'domain', value: '*.example.com', outbound: 'proxy' }, /不支持通配符/],
     [null, /不是对象/],
   ];

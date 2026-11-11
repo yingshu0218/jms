@@ -1,3 +1,4 @@
+import { validateNode } from './node-schema.mjs';
 // 配置生成层：节点对象 → sing-box config.json
 //
 // 字段名以官方文档为准：
@@ -21,7 +22,7 @@ function tlsToSingbox(tls) {
   if (tls.server_name) out.server_name = tls.server_name;
   if (tls.insecure) out.insecure = true;
   if (tls.alpn && tls.alpn.length) out.alpn = tls.alpn;
-  if (tls.utls) out.utls = { enabled: true, fingerprint: tls.utls.fingerprint || 'chrome' };
+  if (tls.utls && tls.utls.enabled !== false) out.utls = { enabled: true, fingerprint: tls.utls.fingerprint || 'chrome' };
   if (tls.reality && tls.reality.enabled) {
     out.reality = {
       enabled: true,
@@ -45,6 +46,7 @@ function transportToSingbox(node) {
 
 /** 单个节点 → sing-box outbound */
 export function nodeToOutbound(node, tag = 'proxy') {
+  node = validateNode(node);
   const base = { tag, server: node.server, server_port: node.server_port };
 
   switch (node.type) {
@@ -106,6 +108,7 @@ export function tagsForNodes(nodes) {
 
 /** 生成全部出站：selector + 每个节点 + direct */
 export function buildOutbounds(nodes, selected = 0, { selectorTag = SELECTOR_TAG } = {}) {
+  nodes = nodes.map(validateNode);
   const tags = tagsForNodes(nodes);
   const nodeOutbounds = nodes.map((n, i) => nodeToOutbound(n, tags[i]));
   const def = tags[Math.max(0, Math.min(selected, tags.length - 1))];
@@ -126,7 +129,7 @@ export function validateOutbound(out) {
   if (!out.server_port || Number.isNaN(out.server_port)) problems.push('server_port 无效');
   if (out.type === 'vless' || out.type === 'vmess') {
     if (!/^[0-9a-fA-F-]{36}$/.test(String(out.uuid || ''))) {
-      problems.push(`uuid 格式可疑: ${String(out.uuid).slice(0, 8)}…`);
+      problems.push('uuid 格式无效');
     }
   }
   if (out.type === 'vless' && out.tls && out.tls.reality && out.tls.reality.enabled) {
@@ -204,11 +207,12 @@ export function buildDnsConfig({
     rules.push({ domain_suffix: FALLBACK_CN_SUFFIXES, server: 'local' });
   }
 
-  // 模式感知：直连档全部本地解析；全局档全部远端
+  // 模式感知：直连档全部本地解析；全局档保留上面的国内 DNS 就近解析例外。
   rules.push({ clash_mode: 'direct', server: 'local' });
   rules.push({ clash_mode: 'global', server: 'remote' });
 
-  const final = routingMode === 'direct' ? 'local' : 'remote';
+  // 默认是 rule 档的远端兜底；direct 由运行时守卫处理，不能绑定冷启动档位。
+  const final = 'remote';
 
   return { servers, rules, final, strategy: 'prefer_ipv4' };
 }
@@ -242,7 +246,7 @@ export function buildRouteRules({
   rules.push({ ip_is_private: true, outbound: 'direct' });
 
   // rule 档才做国内直连；global / direct 档由上面的守卫接管
-  if (routingMode === 'rule' && directRules) {
+  if (directRules) {
     if (ruleSetPaths['geoip-cn']) {
       rules.push(ruleSetPaths['geosite-cn'] ? { rule_set: 'geosite-cn', outbound: 'direct' } : { domain_suffix: FALLBACK_CN_SUFFIXES, outbound: 'direct' });
       rules.push({ action: 'resolve' });
@@ -296,7 +300,7 @@ export function buildConfig(nodes, opts = {}) {
     log: { level: 'info', timestamp: true },
     dns: buildDnsConfig({ routingMode, ruleSetPaths, localDns, remoteDns }),
     experimental: {
-      clash_api: { external_controller: clashApi },
+      clash_api: { external_controller: clashApi, default_mode: routingMode },
       cache_file: { enabled: true },
     },
     inbounds: [

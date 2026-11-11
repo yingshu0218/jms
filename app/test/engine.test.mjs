@@ -258,7 +258,8 @@ test('配置：TUN 进程分流结构正确（捕获全部、只代理指定进�
   assert.equal(config.route.final, 'direct');
 
   // 目标进程的每条分流规则都要带进程限定，绝不误伤其他应用
-  const routing = config.route.rules.filter((r) => !r.action);
+  assert.deepEqual(config.route.rules[0], { inbound: ['mixed-in'], outbound: SELECTOR_TAG });
+  const routing = config.route.rules.filter((r) => !r.action && !r.inbound?.includes('mixed-in'));
   assert.ok(routing.length >= 5);
   for (const r of routing) {
     assert.deepEqual(r.process_name, processNames, `规则缺少进程限定: ${JSON.stringify(r)}`);

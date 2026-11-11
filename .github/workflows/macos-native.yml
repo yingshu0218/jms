@@ -112,6 +112,11 @@ jobs:
           set -o pipefail
           swift test --package-path app/macos 2>&1 | tee app/build/ci/swift-tests.log
           grep -Eq 'Executed [1-9][0-9]* tests?, with 0 failures' app/build/ci/swift-tests.log
+      - name: Proxy preferences helper mock tests (no system writes)
+        run: |
+          set -o pipefail
+          swift test --package-path app/tools/proxy-preferences 2>&1 | tee app/build/ci/proxy-preferences-tests.log
+          grep -Eq 'Executed [1-9][0-9]* tests?, with 0 failures' app/build/ci/proxy-preferences-tests.log
       - name: Build pinned sing-box 1.14.3 from source
         working-directory: app
         run: bash tools/build-macos-core.sh
@@ -122,6 +127,15 @@ jobs:
           set -o pipefail
           SING_BOX="$PWD/app/build/native-core/sing-box" ./app/verify.sh | tee app/build/ci/verify.log
           grep -q 'PASS 27份macOS配置' app/build/ci/verify.log
+      - name: Fixed-core loopback traffic regression (no host network takeover)
+        env:
+          JMS_ALLOW_ISOLATED_CORE_TESTS: '1'
+        run: |
+          set -o pipefail
+          SING_BOX="$PWD/app/build/native-core/sing-box" node app/tools/test-local-core.mjs --require 2>&1 | tee app/build/ci/local-core.log
+          grep -Eq '# pass [1-9][0-9]*$' app/build/ci/local-core.log
+          grep -Eq '# fail 0$' app/build/ci/local-core.log
+          grep -Eq '# skipped 0$' app/build/ci/local-core.log
       - name: Build native Candidate without starting any GUI
         env:
           JMS_BUILD_CONFIGURATION: release
@@ -139,7 +153,7 @@ jobs:
           {
             echo '### Executed macOS gates'
             echo "Checkout: $GITHUB_SHA / architecture: $ARCH"
-            echo 'Swift tests, isolated Node tests, fixed 1.14.3 configuration checks, native Candidate assembly and signature checks completed.'
+            echo 'Swift tests, isolated Node tests, fixed 1.14.3 configuration checks, loopback-only traffic regressions, native Candidate assembly and signature checks completed.'
             echo 'The SEA smoke is isolated; no GUI, real subscription, system proxy, TUN, elevation, routing change, notarization or deployment was exercised.'
             echo 'macOS 13 runtime compatibility is NOT established by deployment-target checks.'
           } >> "$GITHUB_STEP_SUMMARY"

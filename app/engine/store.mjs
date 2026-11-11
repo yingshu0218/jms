@@ -52,13 +52,16 @@ function merge(base, patch) {
   if (!patch || typeof patch !== 'object') return base;
   const out = { ...base };
   for (const [k, v] of Object.entries(patch)) {
+    if (['__proto__', 'constructor', 'prototype'].includes(k)) throw new Error('不支持的状态字段');
     out[k] = v && typeof v === 'object' && !Array.isArray(v) ? merge(base[k] || {}, v) : v;
   }
   return out;
 }
 
 export class Store {
-  constructor(dir = DEFAULT_DIR) {
+  constructor(dir = DEFAULT_DIR, { fileIO = {} } = {}) {
+    this.fileIO = { readFile: readFileSync, writeFile: writeFileSync, chmod: chmodSync, rename: renameSync, ...fileIO };
+    this.revision = 0;
     this.dir = dir;
     this.file = join(dir, 'state.json');
     this.logDir = join(dir, 'logs');
@@ -74,38 +77,48 @@ export class Store {
   }
 
   read() {
+    let raw;
+    try { raw = this.fileIO.readFile(this.file, 'utf8'); }
+    catch (error) {
+      if (error.code === 'ENOENT') return empty();
+      throw Object.assign(new Error('读取本地状态失败，原文件未被重命名或覆盖'), { code: 'STORAGE_READ_FAILED', cause: error });
+    }
     try {
-      const raw = readFileSync(this.file, 'utf8');
-      const state = merge(empty(), JSON.parse(raw));
+      const value = JSON.parse(raw);
+      if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('状态根对象无效');
+      const state = merge(empty(), value);
+      if (!Array.isArray(state.profiles) || !state.subscription || !Array.isArray(state.subscription.nodes)) throw new Error('状态结构无效');
       if (!state.profiles.length && state.subscription.url) {
         state.activeProfileId = 'legacy';
         state.profiles = [{ ...state.subscription, id: 'legacy', name: '原有订阅', selected: state.settings.selected }];
       }
       state.version = 2;
       return state;
-    } catch (e) {
-      if (e.code !== 'ENOENT') {
-        // 损坏的状态文件：重命名保留现场，然后从空状态开始
-        try {
-          renameSync(this.file, `${this.file}.corrupt`);
-        } catch {
-          /* ignore */
-        }
-      }
+    } catch (error) {
+      // 只把确有语法/结构损坏的内容保留为corrupt；权限/IO错误不冒充空配置。
+      try { this.fileIO.rename(this.file, `${this.file}.corrupt`); }
+      catch (failure) { throw Object.assign(new Error('无法保留损坏状态，未创建空配置'), { code: 'STORAGE_READ_FAILED', cause: failure }); }
       return empty();
     }
   }
 
   /** 原子写：先写临时文件再 rename，崩溃也不会留下半个 JSON */
   write(patch) {
-    if (patch) this.state = merge(this.state, patch);
-    writeFileSync(this.tmp, JSON.stringify(this.state, null, 2), { mode: 0o600 });
+    // Candidate与调用者均不别名；任何落盘步骤失败都不得交换内存版本。
+    const candidate = patch ? merge(this.state, patch) : this.state;
+    const payload = JSON.stringify(candidate, null, 2);
+    const next = JSON.parse(payload);
     try {
-      chmodSync(this.tmp, 0o600);
-    } catch {
-      /* ignore */
+      this.fileIO.writeFile(this.tmp, payload, { mode: 0o600 });
+      this.fileIO.chmod(this.tmp, 0o600);
+      this.fileIO.rename(this.tmp, this.file);
+    } catch (error) {
+      try { rmSync(this.tmp, { force: true }); } catch { /* 不隐藏原始失败 */ }
+      error.persistenceFailure = true;
+      throw error;
     }
-    renameSync(this.tmp, this.file);
+    this.state = next;
+    this.revision++;
     return this.state;
   }
 
@@ -120,15 +133,17 @@ export class Store {
         // 订阅链接本身就是凭据：只暴露主机名，方便用户辨认用的是哪一条
         url: s.subscription.url ? maskUrl(s.subscription.url) : '',
         hasUrl: Boolean(s.subscription.url),
-        nodes: s.subscription.nodes.map((n) => ({
-          name: n.name,
-          type: n.type,
-          server: n.server,
-          server_port: n.server_port,
-          security: n.security || (n.tls && n.tls.enabled ? 'tls' : 'none'),
-          flow: n.flow || null,
+        nodes: s.subscription.nodes.map((value, index) => {
+          const n = value && typeof value === 'object' ? value : {};
+          return {
+          name: typeof n.name === 'string' ? n.name.slice(0, 256) : `无效节点 ${index + 1}`,
+          type: typeof n.type === 'string' ? n.type : 'invalid',
+          server: typeof n.server === 'string' ? n.server.slice(0, 253) : '',
+          server_port: Number.isSafeInteger(n.server_port) ? n.server_port : 0,
+          security: ['none', 'tls', 'reality'].includes(n.security) ? n.security : (n.tls?.enabled === true ? 'tls' : 'none'),
+          flow: typeof n.flow === 'string' && n.flow === 'xtls-rprx-vision' ? n.flow : null,
           transport: n.ws ? 'ws' : n.grpc ? 'grpc' : 'tcp',
-        })),
+        }; }),
       },
     };
   }

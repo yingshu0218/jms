@@ -8,9 +8,9 @@ import { prepareIsolatedDirectory } from './isolation.mjs';
 import { validateSettings, CONFIG_FILENAMES } from '../core/settings.mjs';
 import { ProfilesService } from './profiles.mjs';
 import { EventEmitter, once } from 'node:events';
-import { randomBytes } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import { assertPortsAvailable, assertListenerOwnership } from './ports.mjs';
-import { writeFileSync, mkdirSync, readFileSync, existsSync, readdirSync, statSync, chmodSync } from 'node:fs';
+import { writeFileSync, mkdirSync, readFileSync, existsSync, readdirSync, statSync, chmodSync, renameSync, rmSync } from 'node:fs';
 import { join, resolve, dirname } from 'node:path';
 
 import { Store } from './store.mjs';
@@ -19,12 +19,15 @@ import { ClashApi } from './clash-api.mjs';
 import { CoreSupervisor, resolveCoreBinary } from './supervisor.mjs';
 import { ProxyJournal, getAdapter, MockAdapter, enableProxy, disableProxy, healIfNeeded, isPointingAtUs } from './sysproxy/index.mjs';
 import { parseSubscription } from '../core/parse.mjs';
-import { buildConfig, buildOutbounds, SELECTOR_TAG, ROUTING_MODES } from '../core/to-singbox.mjs';
+import { buildConfig, buildOutbounds, tagsForNodes, SELECTOR_TAG, ROUTING_MODES } from '../core/to-singbox.mjs';
 import { APP_PROFILES, buildTunPerAppConfig } from '../core/per-app.mjs';
 import { ensureRuleSets } from './rulesets.mjs';
 import { normalizeCustomRules, rulesDocument, importRules } from '../core/custom-rules.mjs';
 import { runLinkCheck, DEFAULT_TARGETS } from './linkcheck.mjs';
 import { checkTunPrivilege, needsElevation, planElevation, relaunchArguments } from './privilege.mjs';
+
+const emptyEffective = () => ({ selected: null, routingMode: null, node: null, selectionTag: null, known: false, selectionKnown: false, modeKnown: false });
+const canonicalMode = value => typeof value === 'string' && ROUTING_MODES.includes(value.toLowerCase()) ? value.toLowerCase() : null;
 
 export class AppService extends EventEmitter {
   constructor({ dir, coreBinary, adapter, clashApiFactory, latencyCoreRunner = withLatencyCore, isolated = false, controlPort = 7788, supervisorFactory, portsAvailable = assertPortsAvailable, ruleSetProvider = ensureRuleSets, listenerOwnership = assertListenerOwnership } = {}) {
@@ -56,6 +59,13 @@ export class AppService extends EventEmitter {
     this.clashApiFactory = clashApiFactory || ((url, options) => new ClashApi(url, options));
 
     this.supervisor = null;
+    this.sessionId = null;
+    this.sessionNodes = null;
+    this.sessionReady = false;
+    this.effectiveState = emptyEffective();
+    this.runtimeEpoch = 0;
+    this.snapshotProbe = 0;
+    this.persistenceError = null;
     this.lastLatency = new Map();
     this.lastLatencyByTag = new Map();
     this.latencyCoreRunner = latencyCoreRunner;
@@ -131,32 +141,82 @@ export class AppService extends EventEmitter {
 
   /** 节点下标 → 出站标签（必须与配置生成用同一套规则，否则测速/切换会打不到） */
   nodeTags() {
-    return buildOutbounds(this.store.state.subscription.nodes, 0).tags;
+    // 展示/修复旧状态不能因坏节点先调用配置生成器；真正生成仍严格schema校验。
+    return tagsForNodes(this.store.state.subscription.nodes.map((node, index) => node && typeof node === 'object'
+      ? { ...node, name: typeof node.name === 'string' ? node.name : `无效节点 ${index + 1}` }
+      : { name: `无效节点 ${index + 1}`, server: '', server_port: 0 }));
   }
 
+  #sessionToken() {
+    if (!this.sessionId || !this.supervisor?.isRunning()) return null;
+    return { supervisor: this.supervisor, id: this.sessionId, pid: this.supervisor.status().pid };
+  }
+  #sameSession(token) {
+    return Boolean(token && token.supervisor === this.supervisor && token.id === this.sessionId &&
+      this.supervisor?.isRunning() && this.supervisor.status().pid === token.pid);
+  }
+  #assertSession(token) {
+    if (!this.#sameSession(token)) throw Object.assign(new Error('连接会话已变化，已忽略迟到结果'), { code: 'STALE_SESSION' });
+  }
+  async #readEffective(token) {
+    this.#assertSession(token);
+    const api = this.apiClient();
+    const [mode, selection] = await Promise.allSettled([Promise.resolve().then(() => api.getMode()), Promise.resolve().then(() => api.currentSelection(SELECTOR_TAG))]);
+    this.#assertSession(token);
+    const routingMode = mode.status === 'fulfilled' ? canonicalMode(mode.value) : null;
+    const tags = buildOutbounds(this.sessionNodes || [], 0).tags;
+    const selectionTag = selection.status === 'fulfilled' && typeof selection.value === 'string' && tags.includes(selection.value) ? selection.value : null;
+    const selected = selectionTag === null ? null : tags.indexOf(selectionTag);
+    return { selected, routingMode, node: selected === null ? null : this.sessionNodes[selected]?.name ?? null,
+      selectionTag, known: routingMode !== null && selected !== null,
+      selectionKnown: selected !== null, modeKnown: routingMode !== null };
+  }
+  async #calibrateSession(token) {
+    this.#assertSession(token);
+    const expected = this.sessionSettings;
+    const tag = buildOutbounds(this.sessionNodes, expected.selected).tags[expected.selected];
+    const api = this.apiClient();
+    try { await api.setMode(expected.routingMode); await api.select(SELECTOR_TAG, tag); } catch { /* 只以读回证明结果，不把响应丢失当成功/回滚 */ }
+    const actual = await this.#readEffective(token);
+    if (actual.routingMode !== expected.routingMode || actual.selected !== expected.selected) {
+      this.effectiveState = actual;
+      throw Object.assign(new Error('内核未确认所选模式与节点，未接管系统代理'), { code: 'SESSION_UNCONFIRMED' });
+    }
+    this.effectiveState = actual;
+    this.sessionReady = true;
+    this.runtimeEpoch++;
+    return actual;
+  }
+  async #refreshEffective() {
+    const token = this.#sessionToken();
+    if (!token) { this.effectiveState = emptyEffective(); return; }
+    const epoch = this.runtimeEpoch, sequence = ++this.snapshotProbe;
+    try {
+      const actual = await this.#readEffective(token);
+      if (this.#sameSession(token) && epoch === this.runtimeEpoch && sequence === this.snapshotProbe) this.effectiveState = actual;
+    } catch { /* 旧会话不能清除新会话状态 */ }
+  }
   async status() {
+    await this.#refreshEffective();
+    const active = this.sessionSettings || this.store.state.settings;
+    const pointingAtUs = await isPointingAtUs({ adapter: this.adapter, port: active.port });
     const s = this.store.state;
-    const sup = this.supervisor?.status() || { running: false, pid: null, uptimeMs: 0, restarts: 0 };
-    const pointingAtUs = await isPointingAtUs({ adapter: this.adapter, port: s.settings.port });
-    return {
-      ...sup,
-      connected: s.runtime.connected && sup.running,
-      mode: s.settings.mode,
-      port: s.settings.port,
-      node: s.subscription.nodes[s.settings.selected]?.name ?? null,
-      nodeCount: s.subscription.nodes.length,
-      pointingAtUs,
-      pendingProxyJournal: this.journal.isPending(),
-      coreBinary: this.coreBinary,
-      busy: this.busy,
-    };
+    const sup = this.supervisor?.status?.() || { running: false, pid: null, uptimeMs: 0, restarts: 0 };
+    const effective = sup.running ? this.effectiveState : emptyEffective();
+    return { ...sup, connected: Boolean(s.runtime.connected && sup.running && this.sessionReady),
+      mode: active.mode, port: active.port, node: effective.node, nodeCount: s.subscription.nodes.length,
+      pointingAtUs, pendingProxyJournal: this.journal.isPending(), coreBinary: this.coreBinary,
+      busy: this.busy || (this.supervisor && !this.sessionReady ? 'recovering' : null),
+      sessionId: this.sessionId, effective, persistenceError: this.persistenceError };
   }
 
   /** 给 API / UI 的脱敏快照 */
   async snapshot() {
+    const status = await this.status();
     return {
       ...this.store.redacted(),
-      status: await this.status(),
+      status,
+      revision: this.store.revision ?? 0,
       privilege: await this.privilegeStatus(),
       latency: Object.fromEntries(this.lastLatency),
       nodeLatency: Object.fromEntries(this.nodeTags().map((tag, i) => [String(i), this.lastLatencyByTag.get(tag)]).filter(([, result]) => result)) ,
@@ -178,7 +238,8 @@ export class AppService extends EventEmitter {
   async checkLinks({ targets = DEFAULT_TARGETS, timeoutMs = 8000, diagnose = true } = {}) {
     this.assertNetworkAllowed();
     const running = Boolean(this.supervisor?.isRunning());
-    const proxy = running ? { host: '127.0.0.1', port: Number(this.store.state.settings.port) } : null;
+    const activeSettings = this.sessionSettings || this.store.state.settings;
+    const proxy = running ? { host: '127.0.0.1', port: Number(activeSettings.port) } : null;
     if (!running) {
       this.emit('warn', '内核未运行：本次只能做直连检测，无法验证代理链路');
     }
@@ -187,6 +248,8 @@ export class AppService extends EventEmitter {
     const payload = {
       at: Date.now(),
       via: proxy ? 'proxy' : 'direct',
+      routeScope: proxy ? (activeSettings.mode === 'tun-per-app' ? 'selected-node' : 'configured-routing') : 'direct',
+      routingMode: this.effectiveState.routingMode,
       port: proxy ? proxy.port : null,
       results: out.results,
       summary: out.summary,
@@ -301,9 +364,9 @@ export class AppService extends EventEmitter {
   }
 
   // ── 配置生成 ───────────────────────────────────────────────────────────
-  writeConfig({ ruleSetPaths = {} } = {}) {
-    const { nodes } = this.store.state.subscription;
-    const s = this.validatedSettings();
+  writeConfig({ ruleSetPaths = {}, settingsOverride, nodesOverride, staged = false } = {}) {
+    const nodes = nodesOverride || this.store.state.subscription.nodes;
+    const s = this.validatedSettings(settingsOverride || this.store.state.settings);
     if (!nodes.length) throw new Error('没有可用节点，请先刷新订阅');
 
     const selected = Math.max(0, Math.min(s.selected, nodes.length - 1));
@@ -346,16 +409,22 @@ export class AppService extends EventEmitter {
     }
 
     config.experimental.clash_api.secret = this.coreSecret;
-    const file = resolve(this.varDir, CONFIG_FILENAMES[s.mode]);
-    if (dirname(file) !== resolve(this.varDir)) throw new Error('配置路径越界');
-    writeFileSync(file, JSON.stringify(config, null, 2), { mode: 0o600 });
+    // Node的已确认会话/配置是唯一来源，旧cache不能在新启动覆盖mode或selector。
+    config.experimental.cache_file = { enabled: false };
+    const target = resolve(this.varDir, CONFIG_FILENAMES[s.mode]);
+    if (dirname(target) !== resolve(this.varDir)) throw new Error('配置路径越界');
+    // A hot-switch candidate is not a restart configuration until the owned
+    // session has read it back. Crashes during RPC must still spawn old intent.
+    const file = staged ? target + '.' + randomUUID() + '.pending' : target;
+    const temporary = file + '.' + randomUUID() + '.tmp';
     try {
-      chmodSync(file, 0o600);
-    } catch {
-      /* ignore */
-    }
+      writeFileSync(temporary, JSON.stringify(config, null, 2), { mode: 0o600 });
+      chmodSync(temporary, 0o600);
+      renameSync(temporary, file);
+    } finally { rmSync(temporary, { force: true }); }
     meta.mode = s.mode;
     meta.configPath = file;
+    meta.targetConfigPath = target;
     meta.node = nodes[selected]?.name ?? null;
     meta.outboundCount = config.outbounds.length;
     return meta;
@@ -389,6 +458,12 @@ export class AppService extends EventEmitter {
       const meta = this.writeConfig({ ruleSetPaths: ruleSets });
       const settings = { ...this.store.state.settings };
       this.sessionSettings = settings;
+      this.sessionNodes = structuredClone(this.store.state.subscription.nodes);
+      this.sessionRuleSetPaths = ruleSets;
+      this.sessionId = randomUUID();
+      this.sessionReady = false;
+      this.effectiveState = emptyEffective();
+      this.runtimeEpoch++;
 
       if (!this.coreBinary) throw new Error('找不到内核二进制，请设置环境变量 SING_BOX');
 
@@ -402,13 +477,17 @@ export class AppService extends EventEmitter {
         readyCheck: async () => {
           // 先证明两监听属于刚spawn的PID，再向API发送秘密，不能信任任意/version。
           await this.listenerOwnership(ports, this.supervisor.status().pid);
-          return this.apiClient().verifyOwnership();
+          await this.apiClient().verifyOwnership();
+          return this.#calibrateSession(this.#sessionToken());
         },
       });
       this.#wireSupervisor();
 
       this.emit('operation-progress', { stage: '启动代理内核并等待就绪', command: 'sing-box run -c <本地配置，凭据已隐藏>' });
       await this.supervisor.start();
+      // 测试factory也必须经过同一读回门禁；重启由readyCheck校准。
+      await this.#calibrateSession(this.#sessionToken());
+      if (this.draining) throw Object.assign(new Error('引擎正在退出，未接管系统代理'), { code: 'DRAINING' });
 
       // 系统代理模式才需要改系统设置；TUN 模式由内核接管流量
       if (settings.mode === 'sysproxy') {
@@ -446,6 +525,8 @@ export class AppService extends EventEmitter {
       this.supervisor?.closeLog();
       this.supervisor = null;
       this.sessionSettings = null;
+      this.sessionId = null; this.sessionNodes = null; this.sessionReady = false;
+      this.effectiveState = emptyEffective(); this.runtimeEpoch++;
 
       this.store.markRuntime({ connected: false, startedAt: null, pid: null });
       this.profiles.applyPending();
@@ -460,54 +541,82 @@ export class AppService extends EventEmitter {
    * 切换节点：内核在运行时走 Clash API 即时切换（不重连），
    * 否则只更新设置，下次连接生效。
    */
-  async selectNode(index) {
+  #writeSessionConfig(settings) {
+    return this.writeConfig({ settingsOverride: settings, nodesOverride: this.sessionNodes,
+      ruleSetPaths: this.sessionRuleSetPaths || {}, staged: true });
+  }
+  async #switchRuntime(kind, target) {
     this.assertMutable();
-    const nodes = this.store.state.subscription.nodes;
-    if (!Number.isSafeInteger(index) || index < 0 || index >= nodes.length) throw new Error('节点索引无效');
-    const idx = index;
-    this.store.write({ settings: { selected: idx }, profiles: this.store.state.profiles.map(p => p.id === this.store.state.activeProfileId ? { ...p, selected: idx } : p) });
-    const tag = this.nodeTags()[idx];
-
-    if (!this.supervisor?.isRunning()) {
-      return { applied: false, reason: '内核未运行，已记录选择，连接后生效', node: nodes[idx]?.name, tag };
-    }
+    if (this.busy) throw new Error(`正在执行：${this.busy}`);
+    this.busy = kind === 'selected' ? 'select-node' : 'routing-mode';
+    this.runtimeEpoch++;
+    const requested = kind === 'selected' ? { requestedIndex: target } : { requestedMode: target };
+    const result = (applied, persisted, effective, extra = {}) => ({ applied, persisted, ...requested,
+      index: effective.selected, mode: effective.routingMode, node: effective.node, tag: effective.selectionTag,
+      effective: { ...effective }, ...extra });
+    let candidate;
     try {
-      await this.apiClient().select(SELECTOR_TAG, tag);
-      this.emit('selected', { index: idx, node: nodes[idx]?.name, tag });
-      return { applied: true, node: nodes[idx]?.name, tag };
-    } catch (e) {
-      // selector 切换失败（例如内核版本不支持）→ 提示需要重连，而不是静默失败
-      return {
-        applied: false,
-        reason: `即时切换失败（${e.message}），重新连接后生效`,
-        node: nodes[idx]?.name,
-        tag,
-      };
+      const patch = { settings: { [kind]: target } };
+      if (kind === 'selected') patch.profiles = this.store.state.profiles.map(p => p.id === this.store.state.activeProfileId ? { ...p, selected: target } : p);
+      if (this.supervisor && (!this.supervisor.isRunning() || !this.sessionReady)) {
+        throw Object.assign(new Error('内核正在恢复或尚未就绪，请等待确认后重试切换'), { code: 'RESTARTING' });
+      }
+      if (!this.supervisor) {
+        this.store.write(patch); this.persistenceError = null;
+        return result(false, true, emptyEffective(), { reason: '内核未运行，已保存为下次连接设置' });
+      }
+      const token = this.#sessionToken();
+      this.#assertSession(token);
+      const previous = { ...this.sessionSettings };
+      const prepared = { ...previous, [kind]: target };
+      try { candidate = this.#writeSessionConfig(prepared); }
+      catch { return result(false, false, this.effectiveState, { code: 'PERSIST_FAILED', reason: '无法准备重启配置，未向内核发送切换请求' }); }
+      const api = this.apiClient();
+      try {
+        if (kind === 'selected') await api.select(SELECTOR_TAG, this.nodeTags()[target]);
+        else await api.setMode(target);
+      } catch { /* 超时/丢包结果未知，下面读回，不假定成功也不假定没变 */ }
+      if (!this.#sameSession(token)) return result(false, false, emptyEffective(), { code: 'STALE_SESSION', reason: '连接会话已变化，已忽略迟到结果，请重新确认' });
+      const actual = await this.#readEffective(token);
+      this.effectiveState = actual;
+      const confirmed = kind === 'selected' ? actual.selected === target : actual.routingMode === target;
+      if (!confirmed) {
+        return result(false, false, actual, { code: 'SWITCH_UNCONFIRMED', reason: '内核未确认目标已生效，已保留原有保存值；可重新确认或重试' });
+      }
+      this.sessionSettings = prepared;
+      try { renameSync(candidate.configPath, candidate.targetConfigPath); candidate = null; }
+      catch {
+        // The live API did apply it, but a new process must not load an unproven
+        // candidate. Stop automatic retries until an explicit reconnect/recovery.
+        this.supervisor.maxRestarts = 0;
+        this.persistenceError = '当前内核已生效，但重启配置保存失败；自动重启已暂停，请断开后重试';
+        return result(true, false, actual, { code: 'PERSIST_FAILED', reason: this.persistenceError });
+      }
+      try { this.store.write(patch); this.persistenceError = null; }
+      catch {
+        this.persistenceError = '当前内核已生效，但保存失败；重新打开应用可能使用原保存值';
+        return result(true, false, actual, { code: 'PERSIST_FAILED', reason: this.persistenceError });
+      }
+      this.emit(kind === 'selected' ? 'selected' : 'routing-mode', { ...requested, effective: actual });
+      return result(true, true, actual, { confirmed: kind === 'selected' ? actual.selectionTag : actual.routingMode });
+    } catch (error) {
+      if (error.code === 'STALE_SESSION') return result(false, false, emptyEffective(), { code: error.code, reason: error.message });
+      throw error;
+    } finally {
+      if (candidate) {
+        try { rmSync(candidate.configPath, { force: true }); }
+        catch { this.emit('warn', '未确认的临时配置清理失败；它不会被内核读取，请检查本地存储'); }
+      }
+      this.runtimeEpoch++; this.busy = null;
     }
   }
-
-  /**
-   * 切换路由模式（规则 / 全局 / 直连）。
-   *
-   * 内核在运行时走 Clash API **热切换** —— 实测 PATCH /configs 返回 204 且立即生效，
-   * 因此不必重连、不必重启内核。失败才退回"记录设置、重连后生效"。
-   */
+  async selectNode(index) {
+    if (!Number.isSafeInteger(index) || index < 0 || index >= this.store.state.subscription.nodes.length) throw new Error('节点索引无效');
+    return this.#switchRuntime('selected', index);
+  }
   async setRoutingMode(mode) {
-    this.assertMutable();
-    if (!ROUTING_MODES.includes(mode)) throw new Error(`未知的路由模式: ${mode}`);
-    this.store.write({ settings: { routingMode: mode } });
-
-    if (!this.supervisor?.isRunning()) {
-      return { applied: false, reason: '内核未运行，已记录，连接后生效', mode };
-    }
-    try {
-      await this.apiClient().setMode(mode);
-      const confirmed = await this.apiClient().getMode();
-      this.emit('routing-mode', { mode, confirmed });
-      return { applied: true, mode, confirmed };
-    } catch (e) {
-      return { applied: false, reason: `热切换失败（${e.message}），重新连接后生效`, mode };
-    }
+    if (!ROUTING_MODES.includes(mode)) throw new Error('无效的路由模式');
+    return this.#switchRuntime('routingMode', mode);
   }
 
   /** 出任何错时的兜底清理：尽力还原代理 + 杀内核 + 清状态 */
@@ -525,6 +634,8 @@ export class AppService extends EventEmitter {
     this.supervisor?.closeLog();
     this.supervisor = null;
     this.sessionSettings = null;
+    this.sessionId = null; this.sessionNodes = null; this.sessionReady = false;
+    this.effectiveState = emptyEffective(); this.runtimeEpoch++;
     this.store.markRuntime({ connected: false, startedAt: null, pid: null });
   }
 
@@ -532,10 +643,11 @@ export class AppService extends EventEmitter {
     const sup = this.supervisor;
     sup.on('log', (line) => this.emit('core-log', line));
     sup.on('core-error', (e) => this.emit('warn', `内核错误：${e.message}`));
-    sup.on('crash', (info) => this.emit('warn', `内核异常退出（code=${info.code ?? 'null'}），正在重启`));
+    sup.on('crash', (info) => { if (this.supervisor !== sup) return; this.sessionReady = false; this.effectiveState = emptyEffective(); this.runtimeEpoch++; this.emit('warn', `内核异常退出（code=${info.code ?? 'null'}），正在重启`); });
 
     sup.on('restarted', (st) => {
       if (this.supervisor !== sup) return;
+      if (!this.sessionReady) return;
       this.store.markRuntime({ pid: st.pid, restarts: st.restarts });
       this.emit('restarted', st);
     });
@@ -544,17 +656,29 @@ export class AppService extends EventEmitter {
     sup.on('giveup', async (info) => {
       if (this.supervisor !== sup) return;
       this.emit('warn', `内核连续 ${info.restarts} 次启动失败，已停止重试`);
-      try {
-        if (this.journal.isPending()) {
-          await disableProxy({ adapter: this.adapter, journal: this.journal });
-          this.emit('warn', '已还原系统代理设置');
-        }
-      } catch (e) {
-        this.emit('warn', `还原系统代理失败：${e.message}`);
+      // Recovery is a mutation too. Do not restore/clear a journal concurrently
+      // with a foreground transaction or a newer owned connection.
+      while (this.busy) {
+        await once(this, 'idle');
+        if (this.supervisor !== sup) return;
       }
       if (this.supervisor !== sup) return;
-      this.store.markRuntime({ connected: false, pid: null });
-      this.emit('gaveup', info);
+      this.busy = 'recover-proxy';
+      try {
+        try {
+          if (this.journal.isPending()) {
+            await disableProxy({ adapter: this.adapter, journal: this.journal });
+            this.emit('warn', '已还原系统代理设置');
+          }
+        } catch (e) {
+          this.emit('warn', `还原系统代理失败：${e.message}`);
+        }
+        if (this.supervisor !== sup) return;
+        this.sessionReady = false; this.effectiveState = emptyEffective(); this.runtimeEpoch++;
+        try { this.store.markRuntime({ connected: false, pid: null }); }
+        catch { this.emit('warn', '内核已停止，但本地运行状态保存失败，请保留恢复信息并重试'); }
+        this.emit('gaveup', info);
+      } finally { this.busy = null; }
     });
   }
 
@@ -608,6 +732,7 @@ export class AppService extends EventEmitter {
     this.assertMutable();
     if (this.busy) throw new Error(`正在执行：${this.busy}`);
     const next = validateSettings(patch);
+    if (Object.hasOwn(next, 'selected') || Object.hasOwn(next, 'routingMode')) throw new Error('节点和路由模式请使用专用切换接口确认');
     if (!Object.keys(next).length) return this.store.state.settings;
     this.validatedSettings({ ...this.store.state.settings, ...next });
     if (next.selected !== undefined) {

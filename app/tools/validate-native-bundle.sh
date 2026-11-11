@@ -13,11 +13,13 @@ read_plist() { /usr/libexec/PlistBuddy -c "Print :$1" "$PLIST"; }
 [ "$(read_plist JMSIsolatedMode)" = true ]
 plutil -lint "$PLIST"
 for executable in "$APP/Contents/MacOS/JMSNative" \
-  "$APP/Contents/Resources/engine/jms-engine" "$APP/Contents/Resources/core/sing-box"; do
+  "$APP/Contents/Resources/engine/jms-engine" "$APP/Contents/Resources/engine/JMSProxyPreferences" "$APP/Contents/Resources/core/sing-box"; do
   test -x "$executable"
   file "$executable" | grep -q "${EXPECTED_ARCH:-$(uname -m)}"
   codesign --verify --strict "$executable"
+  minimum="$(otool -l "$executable" | awk '/minos / {print $2; exit} /LC_VERSION_MIN_MACOSX/ {old=1} old && /version / {print $2; exit}')"
+  node -e 'const [a,b]=process.argv[1].split(".").map(Number);if(!a||a>13||(a===13&&b>0))process.exit(1)' "$minimum"
 done
 codesign --verify --deep --strict "$APP"
 # Record hashes/provenance, not user data. The Candidate is not Developer ID signed/notarized.
-shasum -a 256 "$APP/Contents/MacOS/JMSNative" "$APP/Contents/Resources/engine/jms-engine" "$APP/Contents/Resources/core/sing-box"
+shasum -a 256 "$APP/Contents/MacOS/JMSNative" "$APP/Contents/Resources/engine/jms-engine" "$APP/Contents/Resources/engine/JMSProxyPreferences" "$APP/Contents/Resources/core/sing-box"

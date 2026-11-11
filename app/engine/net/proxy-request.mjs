@@ -4,8 +4,8 @@
 // 为什么不用 curl：Windows/macOS/Linux 虽然大多自带，但不能假设它一定在，而且要 spawn 进程。
 // 所以自己实现最小可用的 HTTP 代理客户端：明文直发 + HTTPS 走 CONNECT 隧道。
 //
-// 语义约定：**拿到状态码就算"可达"**。403/404 也说明链路是通的 ——
-// 判定"能不能上网"不该被目标站的 HTTP 语义干扰。
+// 语义分离：reachable 表示拿到可信HTTP响应；ok/serviceAvailable只接受2xx/3xx。
+// 尤其代理的502不是节点/目标可用，不能被“本地代理端口有响应”伪装成功。
 
 import { request as httpRequest } from 'node:http';
 import { connect as tlsConnect } from 'node:tls';
@@ -24,9 +24,11 @@ export async function probe(urlStr, { proxy = null, timeoutMs = 8000, ca } = {})
     const status = url.protocol === 'https:'
       ? await viaTls(url, proxy, timeoutMs, ca)
       : await viaHttp(url, proxy, timeoutMs);
-    return { ok: true, status, latencyMs: Date.now() - t0 };
+    const serviceAvailable = Number.isInteger(status) && status >= 200 && status < 400;
+    return { ok: serviceAvailable, reachable: true, serviceAvailable, status, latencyMs: Date.now() - t0,
+      ...(serviceAvailable ? {} : { error: `HTTP ${status}（已响应，但服务未成功）` }) };
   } catch (e) {
-    return { ok: false, error: describeError(e), latencyMs: Date.now() - t0 };
+    return { ok: false, reachable: false, serviceAvailable: false, error: describeError(e), latencyMs: Date.now() - t0 };
   }
 }
 

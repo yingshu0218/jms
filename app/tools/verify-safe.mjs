@@ -36,4 +36,44 @@ try {
     }
   }
   console.log(`PASS ${count}份macOS配置通过固定内核check；没有启动代理、TUN或改写系统设置`);
+  // Separate counters/marker: retain the established 27-config gate above.
+  // Positive cases traverse the same validation/build path as saved rules.
+  const acceptedRules = [
+    ...['(?i)^example\\.com$', '(?im-s:foo)', '(?P<name>foo)', '(?<name>foo)',
+      '(?U)a+', '\\Afoo\\z', '[a-z0-9]+\\.example\\.com', 'a{1,1000}']
+      .map(value => ({ type: 'domain_regex', value, outbound: 'proxy' })),
+    ...['0.0.0.0/0', '255.255.255.255/32', '192.0.2.1', '::/0', '::1/128',
+      '2001:db8::/32', '1:2:3:4:5:6:7:8', '::ffff:192.0.2.1/128']
+      .map(value => ({ type: 'ip_cidr', value, outbound: 'direct' })),
+  ];
+  const { rulesDocument } = await import('../core/custom-rules.mjs');
+  for (const rule of acceptedRules) {
+    const validated = rulesDocument([rule]).rules;
+    check(buildConfig(nodes, { customRules: validated }));
+  }
+  // Bypass UI validation deliberately: these are JavaScript-valid expressions
+  // which Go/RE2 must reject, and malformed IP/CIDR typed directly into config.
+  const rejectedRules = [
+    ...['a(?=b)', 'a(?!b)', '(?<=a)b', '(?<!a)b', '(a)\\1', '(?<x>a)\\k<x>']
+      .map(value => ({ domain_regex: [value], outbound: 'proxy' })),
+    ...['999.1.2.3/24', '1.2.3.4/33', '::1/129', '1::2::3/64']
+      .map(value => ({ ip_cidr: [value], outbound: 'direct' })),
+  ];
+  for (const [index, rule] of rejectedRules.entries()) {
+    const config = buildConfig(nodes);
+    config.route.rules.unshift(rule);
+    const file = join(dir, `negative-${index}.json`);
+    writeFileSync(file, JSON.stringify(config), { mode: 0o600 });
+    const result = spawnSync(core, ['check', '-c', file], { encoding: 'utf8', timeout: 20_000 });
+    if (result.error) throw result.error;
+    if (result.signal || result.status === null) throw new Error('Negative config check terminated unexpectedly');
+    if (result.status === 0) throw new Error(`Fixed core unexpectedly accepted negative rule ${index}`);
+    // Nonzero alone is not enough: a missing file/loader failure is not a
+    // successful rejection of this rule. Require the relevant parser diagnostic.
+    const diagnostic = (result.stderr || '') + (result.stdout || '');
+    const expected = rule.domain_regex ? /regexp|regular expression|regex|perl syntax|escape sequence/i : /prefix|CIDR|IP address|ParseAddr|ParsePrefix/i;
+    if (!expected.test(diagnostic)) throw new Error(`Negative rule ${index} failed for an unrelated reason: ${diagnostic.slice(0, 500)}`);
+  }
+  console.log(`PASS fixed-core rule validation: ${acceptedRules.length} accepted, ${rejectedRules.length} rejected; check only`);
+
 } finally { rmSync(dir, { recursive: true, force: true }); }

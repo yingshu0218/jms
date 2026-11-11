@@ -70,6 +70,8 @@ import AppKit
         guard let resources = resourcesDirectory else { throw APIError(message: "应用资源缺失") }
         let engine = resources.appendingPathComponent("engine/jms-engine")
         let core = resources.appendingPathComponent("core/sing-box")
+        let proxyHelper = resources.appendingPathComponent("engine/JMSProxyPreferences")
+        guard FileManager.default.isExecutableFile(atPath: proxyHelper.path) else { throw APIError(message: "随包系统代理恢复工具缺失，请重新构建应用") }
         guard FileManager.default.isExecutableFile(atPath: engine.path), FileManager.default.isExecutableFile(atPath: core.path) else { throw APIError(message: "随包引擎或 sing-box 缺失，请重新构建应用") }
         let dir = try configuration.stateDirectory(applicationSupport: FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0])
         // The isolated Node entry owns directory creation, lock and marker checks.
@@ -101,6 +103,7 @@ import AppKit
             }
         }
         var environment = ProcessInfo.processInfo.environment
+        environment["JMS_PROXY_HELPER"] = proxyHelper.path
         environment["JMS_API_TOKEN"] = credentials.token
         environment["JMS_INSTANCE_ID"] = credentials.instanceId
         p.environment = environment

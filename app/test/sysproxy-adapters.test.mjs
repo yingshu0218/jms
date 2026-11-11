@@ -103,7 +103,7 @@ test('Windows：还原时原本无 ProxyServer 应删除该项，而不是写空
 });
 
 test('Windows：还原缺快照要报错，不能静默什么都不做', () => {
-  assert.throws(() => planWin32({ mode: 'restore', base: null }), /需要快照/);
+  assert.throws(() => planWin32({ mode: 'restore', base: null }), /快照/);
 });
 
 test('Windows：默认绕行列表覆盖本机与私有网段', () => {
@@ -123,10 +123,10 @@ test('Windows：所有写入都打到 HKCU 下的 Internet Settings', () => {
 // ───────────────────────────── macOS ─────────────────────────────
 test('macOS：解析 -getwebproxy 输出', () => {
   const on = 'Enabled: Yes\nServer: 127.0.0.1\nPort: 2080\nAuthenticated Proxy Enabled: 1\n';
-  assert.deepEqual(parseMacProxy(on), { enabled: true, host: '127.0.0.1', port: 2080 });
+  assert.deepEqual(parseMacProxy(on), { enabled: true, host: '127.0.0.1', port: 2080, authenticated: true });
   // 端口 0 视为「没有端口」，对外统一成 null —— 上层不用区分 0 和 null
-  assert.deepEqual(parseMacProxy('Enabled: No\nServer: \nPort: 0\n'), {
-    enabled: false, host: null, port: null,
+  assert.deepEqual(parseMacProxy('Enabled: No\nServer: \nPort: 0\nAuthenticated Proxy Enabled: 0\n'), {
+    enabled: false, host: null, port: null, authenticated: false,
   });
 });
 
@@ -136,20 +136,21 @@ test('macOS：网络服务列表要跳过说明行和已停用的服务', () => 
 });
 
 const twoServices = {
+  schema: 2,
   services: [
     {
-      name: 'Wi-Fi',
-      webproxy: { enabled: true, host: 'corp.proxy', port: 8080 },
-      securewebproxy: { enabled: true, host: 'corp.proxy', port: 8080 },
-      socksfirewallproxy: { enabled: false, host: null, port: null },
-      bypass: ['*.corp.com'],
+      id: '11111111-1111-4111-8111-111111111111', device: 'en0', name: 'Wi-Fi',
+      webproxy: { enabled: true, authenticated: false, host: 'corp.proxy', port: 8080 },
+      securewebproxy: { enabled: true, authenticated: false, host: 'corp.proxy', port: 8080 },
+      socksfirewallproxy: { enabled: false, authenticated: false, host: 'stored.example', port: 3128 },
+      bypass: ['*.corp.com'], autoproxy: {url:null,enabled:false}, autodiscovery:false,
     },
     {
-      name: 'Ethernet',
-      webproxy: { enabled: false, host: null, port: null },
-      securewebproxy: { enabled: false, host: null, port: null },
-      socksfirewallproxy: { enabled: true, host: '10.0.0.9', port: 1080 },
-      bypass: [],
+      id: '22222222-2222-4222-8222-222222222222', device: 'en1', name: 'Ethernet',
+      webproxy: { enabled: false, authenticated: false, host: 'stored.example', port: 3128 },
+      securewebproxy: { enabled: false, authenticated: false, host: 'stored.example', port: 3128 },
+      socksfirewallproxy: { enabled: true, authenticated: false, host: '10.0.0.9', port: 1080 },
+      bypass: [], autoproxy: {url:null,enabled:false}, autodiscovery:false,
     },
   ],
 };
@@ -177,7 +178,7 @@ test('macOS：还原保持逐项原值 —— 原本关着的协议必须仍然�
   assert.ok(flat.includes('-setwebproxystate Ethernet off'));
   assert.ok(flat.includes('-setsecurewebproxystate Ethernet off'));
   // Ethernet 的 socks 原本开着，端口必须写回 1080 而不是我们用的 2080
-  assert.ok(flat.some((a) => a === '-setsocksfirewallproxy Ethernet 10.0.0.9 1080'));
+  assert.ok(flat.some((a) => a === '-setsocksfirewallproxy Ethernet 10.0.0.9 1080 off'));
   // Wi-Fi 原本的代理要写回 corp.proxy:8080
   assert.ok(flat.some((a) => a.includes('corp.proxy 8080')));
 });
@@ -203,7 +204,7 @@ test('macOS：默认绕行是 CIDR 风格，不能用 Windows 的通配写法', 
 });
 
 test('macOS：还原缺快照要报错', () => {
-  assert.throws(() => planDarwin({ mode: 'restore', base: {} }), /需要快照/);
+  assert.throws(() => planDarwin({ mode: 'restore', base: {} }), /快照/);
 });
 
 // ───────────────────────────── Linux ─────────────────────────────
