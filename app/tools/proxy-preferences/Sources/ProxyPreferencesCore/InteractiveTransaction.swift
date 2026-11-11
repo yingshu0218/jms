@@ -2,7 +2,8 @@ import Foundation
 import CryptoKit
 
 /// A future platform implementation must release the SC session before releasing
-/// its short-lived authorization reference. No platform authorizer exists here.
+/// its short-lived authorization reference. The source-only system provider is
+/// not selected by the default runner, CLI, or Candidate.
 public protocol InteractiveAuthorizationProvider {
     func withStore<T>(_ body: (PreferencesStore) throws -> T) throws -> T
 }

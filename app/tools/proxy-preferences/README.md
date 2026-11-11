@@ -41,7 +41,7 @@ A locked prepare precedes a five-second durable-journal ACK,
 and only the matching ACK permits staging/Commit/Apply plus two readbacks. Its
 transport callback must enforce the supplied monotonic deadline; the model also
 rejects late callbacks. Tests use only `MemoryStore` and fake authorization.
-The only supplied provider is `UnavailableInteractiveAuthorization`.
+The only selected/default provider is `UnavailableInteractiveAuthorization`.
 `--interactive` deliberately returns `AUTHORIZATION_REQUIRED` without creating
 an authorization reference. No privilege helper, permission prompt, or system
 write is enabled by this model. A platform authorizer and bounded private-pipe
@@ -52,3 +52,31 @@ the raw `NetworkServices` dictionaries. It does not lock, authorize, commit, or
 apply. Equal observations are only a stable candidate, never a transactional
 snapshot or a guarantee against changes after the samples. Tests inject reads
 and never observe the host's actual preferences.
+
+### Source-only scoped platform authorizer (not enabled)
+
+`SystemAuthorizationProvider` now contains the platform adapter **source**, but
+nothing selects it: the default runner remains unavailable and `--interactive`
+still rejects before reading input or creating a preferences/authorization
+session. Candidate is unchanged. Building this source is not an authorization
+or system-proxy acceptance test.
+
+Constructing the provider only stores closures. An eventual explicitly gated
+`withStore` call creates a fresh reference using `AuthorizationCreate` with no
+rights, environment, or flags, then a non-nil reference is passed to
+`SCPreferencesCreateWithAuthorization`. SC requests its own rights. There is no
+hardcoded right, preflight CopyRights, external form, cached reference, daemon,
+setuid, authorization-database edit, or `destroyRights`. macOS can ask again at
+Lock, Commit, or Apply; this does not guarantee one prompt or unattended recovery.
+
+Each scope closes and invalidates its SC session before freeing the reference
+with default flags, on success or failure. Escaping store objects cannot perform
+later reads/writes/commit/apply. Store access and close are serialized. Tests
+inject all authorization/session calls and use opaque non-dereferenced sentinels;
+they never call Security, inspect host preferences, or alter the network.
+
+Activation remains a separate reviewed step and requires expressly approved
+isolated-Mac validation: admin and standard accounts, denial/cancel/expiry/repeat
+prompts, MDM restrictions, actual Commit/Apply/readback/restoration, every crash
+window, sleep/logout/multiple users, and supported macOS versions. Existing VPN
+scope and Keychain-only authentication limits remain unchanged.

@@ -26,6 +26,8 @@ import SwiftUI
     // Test injection never carries an authorization reference. Production only
     // reaches the owned Runtime's private Native pipe from an explicit action.
     var nativeProxyAction: ((String) async throws -> Void)?
+    // Pure test seam. Production always asks the owned Runtime, never a PID lookup.
+    var proxyHelperExitCheck: (() async throws -> Void)?
     init(runtime: EngineRuntime? = nil) {
         self.runtime = runtime ?? EngineRuntime()
         self.runtime.onTermination = { [weak self] in
@@ -251,9 +253,27 @@ import SwiftUI
             try? await Task.sleep(nanoseconds: 2_000_000_000)
         }
     }
+    private static let helperExitMessage = "退出未完成：代理助手或恢复结果尚未确认，请等待操作完成并重新检查后重试。"
+    private func checkProxyHelperExit() async throws {
+        do {
+            if let proxyHelperExitCheck { try await proxyHelperExitCheck() }
+            else { try await runtime.ensureProxyHelperInactive() }
+        } catch {
+            // Never expose helper stderr, private frames, or an injected raw error.
+            throw APIError(message: Self.helperExitMessage, code: "PROXY_HELPER_EXIT_UNCONFIRMED")
+        }
+    }
+    private func helperExitBlocked() -> Bool {
+        shuttingDown = false
+        shutdownError = Self.helperExitMessage
+        error = Self.helperExitMessage
+        return false
+    }
     func shutdown() async -> Bool {
         guard !shuttingDown else { return false }
         shuttingDown = true
+        do { try await checkProxyHelperExit() }
+        catch { return helperExitBlocked() }
         // Cancelling an HTTP request does not cancel its server-side operation.
         // Drain in-flight mutations before asking the engine to reject new ones.
         if !ready {
@@ -264,6 +284,9 @@ import SwiftUI
         await mutationTask?.value
         await routingTask?.value
         await checkingTask?.value
+        // Mutations may have created an owned helper while they were draining.
+        do { try await checkProxyHelperExit() }
+        catch { return helperExitBlocked() }
         if runtime.process?.isRunning != true {
             if runtime.canExitWithoutLiveEngine { return true }
             shuttingDown = false
@@ -279,18 +302,27 @@ import SwiftUI
             if !runtime.configuration.isolated, snapshot?.status.pendingProxyJournal == true {
                 try await runNativeProxyAction("disconnect")
             }
+            try await checkProxyHelperExit()
             _ = try await client.request("api/shutdown", body: [:])
             try await ShutdownCoordinator.run(
                 status: { try await self.client.snapshot().status },
                 disconnect: { _ = try await self.client.request("api/disconnect", body: [:]) },
-                stop: { try await self.runtime.stopOwnedProcess() })
+                stop: {
+                    try await self.checkProxyHelperExit()
+                    try await self.runtime.stopOwnedProcess()
+                })
+            try await checkProxyHelperExit()
             // Mark only after the authenticated shutdown, both status checks and
             // owned process stop have all completed for this exact launch.
-            runtime.recordVerifiedCleanup(instanceId: shutdownInstanceId)
+            guard runtime.recordVerifiedCleanup(instanceId: shutdownInstanceId) else {
+                throw APIError(message: Self.helperExitMessage, code: "PROXY_HELPER_EXIT_UNCONFIRMED")
+            }
             polling?.cancel(); events?.cancel()
             return true
         } catch {
-            // Keep the owned engine alive on restoration failure, then allow retry.
+            // A live/unknown helper must not be followed by a resume mutation.
+            if runtime.hasActiveProxyHelper || ["PROXY_HELPER_EXIT_UNCONFIRMED", "NATIVE_PROXY_UNKNOWN"].contains((error as? APIError)?.code ?? "") { return helperExitBlocked() }
+            // Keep the owned engine alive on other restoration failures, then allow retry.
             _ = try? await client.request("api/resume", body: [:])
             shuttingDown = false
             self.shutdownError = "退出未完成：\(error.localizedDescription)"

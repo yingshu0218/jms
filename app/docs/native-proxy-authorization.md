@@ -2,21 +2,81 @@
 
 ## Current boundary
 
-The private transaction protocol and state machine are implemented, but this
-phase deliberately has **no production AuthorizationServices provider**.
+The private transaction protocol, state machine, and source-only platform
+adapters are implemented. **No production path selects an AuthorizationServices
+provider or real helper driver.**
 `UnavailableInteractiveAuthorization`, `UnavailableNativeProxyHelper`, and the
 helper's `--interactive` rejection prevent a forged flag, HTTP request, or
 Candidate from obtaining rights. Mock success is not proof that a normal macOS
 user can connect or restore system proxy settings.
 
-A later, separately reviewed adapter may create a short-lived AuthorizationRef
-inside the directly launched bundled helper. It must use a non-nil reference
+The unselected adapter source can create a short-lived AuthorizationRef inside
+a directly launched bundled helper only after a future explicitly reviewed
+activation. It uses a non-nil reference
 with SCPreferencesCreateWithAuthorization, never an arbitrary command runner,
 sudo, setuid, changed authorization database, credentials in argv/environment,
 or AuthorizationExternalForm in our HTTP, files or logs. Apple's own framework
 may legitimately pass authorization to its system helper over Mach. No rights
 reference is retained across transactions, and shared system rights must not be
 revoked with destroyRights merely to force another prompt.
+
+## Source-only platform adapter stage
+
+`SystemAuthorizationProvider` stores system-call closures without calling them
+at construction. A future explicit scope creates a new reference with nil rights,
+nil environment and default flags, creates a fixed authorized SC session, then
+invalidates/closes that session before freeing the reference with default flags.
+Escaped store objects cannot access the session after scope end. There is no
+CopyRights preflight, shared-right revocation, external form or reusable ref.
+
+`ProcessNativeProxyHelperDriver` and its real transport are present but are not
+referenced by default Broker/Runtime factories. A future typed confirmation must
+be consumed once within thirty monotonic seconds before process creation. The
+review model verifies exact SHA-256 bytes, strict schemas/identities and
+unambiguous bounded JSON, and retains only the action, apply loopback port,
+service-name/count summary and binding identifiers. Restore does not decode or
+display opaque endpoints or infer a port from pending settings.
+
+The real factory only accepts formal nonisolated bundle metadata and the fixed,
+non-symlink bundled helper path, with constant `--interactive`, no shell, a
+minimal environment allowlist/fixed PATH and discarded raw stderr. It owns its
+anonymous pipes/process. It records possible permission delivery before writing
+any commit byte. Once permission may have been sent, timeout/EOF/partial write or
+cancellation stays unknown: no replay and no helper kill; data is boundedly
+drained until confirmed owned exit. Old process generations cannot finalize a
+new operation. Before permission, cancellation can stop only this owned helper.
+
+This is not a connected authorization experience. The default helper CLI still
+rejects `--interactive` before reading stdin or creating either session; the
+production two-line helper transport with a hard five-second ACK read and the
+actual Native confirmation presenter are not wired. Adding source/fixtures does
+not authorize enabling them. Ordinary tests inject every factory, authorization
+and store call; no test may use the real factory or real system preferences.
+
+## Explicit activation blockers
+
+The fixed bundle metadata, path and build-time codesign checks are **not a
+runtime identity trust anchor**. Before production activation, Native must
+validate the helper's running designated requirement and same trusted signing
+identity. In the other direction the helper must authenticate the requesting
+Native process/peer, not merely accept an anonymous stdin pipe. Otherwise any
+local process could launch `--interactive` directly, potentially using OS-cached
+rights without a new password dialog. The current unconditional CLI rejection
+preserves this boundary. Environment tokens, replayable credentials, bundle-ID
+strings or a fresh authorization reference are not substitutes.
+
+A successful helper frame is not an exit proof. Production cleanup must wait
+boundedly for the corresponding owned helper to exit, without killing a process
+that may have received commit permission. Native's cleanup/Quit checks must cover
+active helpers even if Node has no journal or its engine has already died, and
+must not discard an older broker while its helper still owns an operation.
+These pure lifetime models are not real crash/authorization acceptance.
+
+The actual confirmation presenter and bounded helper-side interactive reader
+remain unconnected. Any future confirmation must describe the full apply
+scope, including HTTP/HTTPS/SOCKS loopback target, PAC/discovery and bypass effects,
+services affected, and manual-recovery limits. Neither these source adapters nor
+passing mocks authorize enabling a production path.
 
 ## Product choice and recovery guarantee
 

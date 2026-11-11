@@ -5,7 +5,7 @@ import CoreFoundation
     var isActive: Bool { get }
     func request(_ request: [String: Any]) async throws -> [String: Any]
     func cancelBeforeCommit() async
-    func complete() async
+    func complete() async throws
 }
 
 /// Deliberately no AuthorizationServices or Process launcher in this first phase.
@@ -15,7 +15,7 @@ import CoreFoundation
         throw NativeProxyCodec.error("AUTHORIZATION_REQUIRED")
     }
     func cancelBeforeCommit() async { }
-    func complete() async { }
+    func complete() async throws { }
 }
 
 @MainActor final class NativeProxyBroker {
@@ -33,6 +33,9 @@ import CoreFoundation
     private var handling = false
     private var uncertain = false
     private var closingOperation = false
+    private var completion: CheckedContinuation<Void, Error>?
+    private var completionID: UUID?
+    private var completionTimer: Task<Void, Never>?
     init(isolated: Bool, launchId: String, isAlive: @escaping () -> Bool,
          sendFrame: @escaping ([String: Any]) async throws -> Void,
          helperDriver: NativeProxyHelperDriver? = nil,
@@ -96,9 +99,13 @@ import CoreFoundation
                 if sequence == 2 && response["ok"] as? Bool != true { uncertain = true }
                 try await sendFrame(["version": 1, "type": "helper-result", "launchId": launchId, "operationId": operationId ?? "", "sequence": sequence, "planDigest": frame["planDigest"] ?? "", "response": response])
             case "complete":
-                try gate.complete(frame)
+                var verifiedGate = gate
+                try verifiedGate.complete(frame)
+                let completingOperation = operationId
+                try await completeDriverBounded()
+                guard pending != nil, operationId == completingOperation, isAlive(), !driver.isActive else { throw NativeProxyCodec.error("NATIVE_PROXY_UNKNOWN") }
                 if frame["ok"] as? Bool != true && gate.commitPermitted { uncertain = true }
-                await driver.complete()
+                gate = verifiedGate
                 if frame["ok"] as? Bool == true { uncertain = false; finish(error: nil) }
                 else {
                     let allowed = ["AUTHORIZATION_REQUIRED", "SYS_PROXY_AUTHORIZATION_REQUIRED", "NATIVE_PROXY_UNKNOWN"]
@@ -109,6 +116,33 @@ import CoreFoundation
             default: throw NativeProxyCodec.error()
             }
         } catch { await fail(code: "NATIVE_CONTROL_INVALID") }
+    }
+    var hasActiveHelper: Bool { driver.isActive }
+    func ensureHelperInactive() throws {
+        guard !driver.isActive else { throw NativeProxyCodec.error("NATIVE_PROXY_UNKNOWN") }
+    }
+    private func completeDriverBounded() async throws {
+        let id = UUID(), completingOperation = operationId; completionID = id
+        try await withCheckedThrowingContinuation { continuation in
+            completion = continuation
+            completionTimer = Task { [weak self] in
+                guard let self else { return }
+                do { try await self.sleep(2_000_000_000) } catch { return }
+                self.finishCompletion(id: id, error: NativeProxyCodec.error("NATIVE_PROXY_UNKNOWN"))
+            }
+            Task { [weak self] in
+                guard let self else { return }
+                guard self.completionID == id, self.operationId == completingOperation, self.pending != nil else { return }
+                do { try await self.driver.complete(); self.finishCompletion(id: id, error: nil) }
+                catch { self.finishCompletion(id: id, error: NativeProxyCodec.error("NATIVE_PROXY_UNKNOWN")) }
+            }
+        }
+    }
+    private func finishCompletion(id: UUID, error: Error?) {
+        guard completionID == id else { return }
+        completionID = nil; completionTimer?.cancel(); completionTimer = nil
+        let continuation = completion; completion = nil
+        if let error { continuation?.resume(throwing: error) } else { continuation?.resume() }
     }
     private func armTimeout(seconds: UInt64) {
         timeout?.cancel()
@@ -127,6 +161,7 @@ import CoreFoundation
     func revoke() async { hello = false; await fail(code: "ENGINE_LEASE_INVALID") }
     private func fail(code: String) async {
         let committed = gate.commitPermitted
+        if let id = completionID { finishCompletion(id: id, error: NativeProxyCodec.error("NATIVE_PROXY_UNKNOWN")) }
         uncertain = uncertain || committed
         let cancelledOperation = operationId
         closingOperation = true

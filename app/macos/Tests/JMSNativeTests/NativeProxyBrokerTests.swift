@@ -82,11 +82,24 @@ final class NativeProxyBrokerTests: XCTestCase {
     @MainActor func testPostpermitFailuresRequireExplicitInactiveDisconnectRecovery() async throws {
         for failure in [false as Any, true as Any, "unknown" as Any] { try await exerciseCommit(failure: failure) }
     }
-    @MainActor private func exerciseCommit(failure: Any?) async throws {
+    @MainActor func testCompletionErrorOrTimeoutRetainsPermitAndLateExitCannotSucceed() async throws {
+        try await exerciseCommit(failure: nil, completionMode: 1)
+        try await exerciseCommit(failure: nil, completionMode: 2)
+    }
+    @MainActor func testCompletionWaitsForDelayedInactiveProof() async throws {
+        try await exerciseCommit(failure: nil, completionMode: 3)
+    }
+    @MainActor private func exerciseCommit(failure: Any?, completionMode: Int = 0) async throws {
         let launch = UUID().uuidString, driver = SuccessfulFakeNativeProxyDriver()
         driver.failureCommit = failure
+        driver.completionMode = completionMode
+        let completionTimer = FakeBrokerCompletionTimer()
+        defer { completionTimer.cancel(); driver.releaseAfterExit() }
         var sent: [[String: Any]] = []
-        let broker = NativeProxyBroker(isolated: false, launchId: launch, isAlive: { true }, sendFrame: { sent.append($0) }, helperDriver: driver)
+        let broker = NativeProxyBroker(isolated: false, launchId: launch, isAlive: { true }, sendFrame: { sent.append($0) }, helperDriver: driver, sleep: { duration in
+            if duration == 2_000_000_000 && completionMode == 2 { try await completionTimer.wait(); return }
+            throw CancellationError() // Other budgets are not advanced in this fixture.
+        })
         await broker.receive(["version": 1, "type": "hello", "launchId": launch])
         let action = Task { try await broker.perform(action: "connect") }
         try await wait { !sent.isEmpty }
@@ -100,6 +113,28 @@ final class NativeProxyBrokerTests: XCTestCase {
         let preparedDigest = try XCTUnwrap(response["preparedDigest"] as? String)
         await broker.receive(["version": 1, "type": "helper", "launchId": launch, "operationId": operation, "sequence": 2, "planDigest": digest, "request": ["operation": "interactiveCommit", "operationId": operation, "planDigest": digest, "preparedDigest": preparedDigest]])
         XCTAssertEqual(driver.calls, 2)
+        if completionMode != 0 {
+            let completing = Task { await broker.receive(["version": 1, "type": "complete", "launchId": launch, "operationId": operation, "ok": true, "result": ["confirmed": true, "helperUsed": true]]) }
+            if completionMode >= 2 { try await wait { driver.waitingForExit } }
+            if completionMode == 2 {
+                try await wait { completionTimer.isArmed }
+                completionTimer.fire() // Driver is definitely inside complete before watchdog fires.
+            }
+            if completionMode == 3 {
+                XCTAssertThrowsError(try broker.ensureHelperInactive())
+                driver.releaseAfterExit()
+                await completing.value; try await action.value
+                try broker.ensureHelperInactive()
+            } else {
+                await completing.value
+                do { try await action.value; XCTFail("Unconfirmed complete succeeded") }
+                catch let error as APIError { XCTAssertEqual(error.code, "NATIVE_PROXY_UNKNOWN") }
+                XCTAssertThrowsError(try broker.ensureHelperInactive())
+                driver.releaseAfterExit(); await Task.yield()
+                do { try await broker.perform(action: "connect"); XCTFail("Late completion erased UNKNOWN") } catch { }
+            }
+            return
+        }
         if failure == nil {
             await broker.receive(["version": 1, "type": "complete", "launchId": launch, "operationId": operation, "ok": true, "result": ["confirmed": true, "helperUsed": true]])
             try await action.value
@@ -161,6 +196,13 @@ final class NativeProxyBrokerTests: XCTestCase {
     var calls = 0
     var isActive = false
     var failureCommit: Any?
+    var completionMode = 0
+    private var completionContinuation: CheckedContinuation<Void, Never>?
+    var waitingForExit: Bool { completionContinuation != nil }
+    func releaseAfterExit() {
+        isActive = false
+        let saved = completionContinuation; completionContinuation = nil; saved?.resume()
+    }
     private let snapshot: [String: Any] = ["schema": 3, "services": [["id": "11111111-1111-1111-1111-111111111111", "name": "Fake", "device": "fake0", "proxies": ["present": false, "blob": NSNull()]]]]
     func request(_ request: [String: Any]) async throws -> [String: Any] {
         calls += 1; isActive = true
@@ -175,5 +217,22 @@ final class NativeProxyBrokerTests: XCTestCase {
         return ["ok": true, "phase": "finished", "operationId": request["operationId"]!, "planDigest": request["planDigest"]!, "preparedDigest": request["preparedDigest"]!, "snapshot": snapshot, "verifiedSnapshot": snapshot, "committed": true, "applied": true]
     }
     func cancelBeforeCommit() async { isActive = false }
-    func complete() async { isActive = false }
+    func complete() async throws {
+        if completionMode == 1 { throw APIError(message: "Private complete error") }
+        if completionMode >= 2 { await withCheckedContinuation { completionContinuation = $0 }; return }
+        isActive = false
+    }
+}
+
+@MainActor private final class FakeBrokerCompletionTimer {
+    private var continuation: CheckedContinuation<Void, Error>?
+    var isArmed: Bool { continuation != nil }
+    func wait() async throws {
+        try await withTaskCancellationHandler(operation: {
+            try await withCheckedThrowingContinuation { continuation = $0 }
+        }, onCancel: { Task { @MainActor in self.cancel() } })
+        try Task.checkCancellation()
+    }
+    func fire() { let saved = continuation; continuation = nil; saved?.resume() }
+    func cancel() { let saved = continuation; continuation = nil; saved?.resume(throwing: CancellationError()) }
 }

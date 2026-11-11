@@ -64,7 +64,13 @@ JMS_NATIVE_IPC_SMOKE=1 JMS_NATIVE_IPC_BUNDLE="$PWD/app/dist/JMS Client Candidate
   swift test --package-path app/macos --filter NativeControlPipeSmokeTests/testPrivatePipeToIsolatedBundledSEA
 ```
 
-CI要求该项实际执行1项、0失败、0跳过。测试控制器通过真实NativeProxyPipe/Broker连接随包SEA；SEA始终 `--isolated --native-control`，必须拒绝begin且helper计数0。发送Bearer前核对真实owned PID监听，确认身份/空订阅/无journal、前后状态及假正式目录sentinel不变，认证shutdown后保持父pipe直到自有child正常退出并收到EOF；watchdog清理不计成功。未调用真实helper/core/授权，没有把Runtime改为非隔离；该项不是正式系统代理、非隔离授权或GUI验收。当前该新增项仍待本批CI实际运行。
+CI要求该项实际执行1项、0失败、0跳过。测试控制器通过真实NativeProxyPipe/Broker连接随包SEA；SEA始终 `--isolated --native-control`，必须拒绝begin且helper计数0。发送Bearer前核对真实owned PID监听，确认身份/空订阅/无journal、前后状态及假正式目录sentinel不变，认证shutdown后保持父pipe直到自有child正常退出并收到EOF；watchdog清理不计成功。未调用真实helper/core/授权，没有把Runtime改为非隔离；该项不是正式系统代理、非隔离授权或GUI验收。该新增项已在下节53b的两架构CI实际运行通过，不代表正式授权。
+
+### 第四批实际结果与第五批 source-only 界限
+
+第四批 `53b91be` 的[准确SHA CI](https://github.com/yingshu0218/jms/actions/runs/43085310823)已实际全绿：两架构各94项Native、32项helper，Node574总/563通过/11明确跳过，27配置及16正/10负规则、8项真实SS回环、原Runtime IPC与新增真实私pipe拒绝smoke各1项均执行通过。新私pipe smoke用的SEA始终isolated、helper调用0次；不是正式权限或GUI验收。
+
+第五批添加不被默认路径引用的platform provider/Process driver源码与typed review模型，并加强关闭后的SC session失效和默认退出模型。新增45项纯fixture声明（Native36/helper9），在Linux尚未编译/执行Swift；预计普通Native130/helper41项，须新SHA的实际日志证明，不得沿用53b的94/32结果冒充验证。真实AuthorizationCalls/SC/Process factory全部被fake替换。成功帧必须等自有helper实际退出才可返回Node；超时保unknown且不强杀，旧complete等待不能影响新代恢复，Quit在无journal/Node已退出时也不能绕过live helper或继承旧launch清理证明。默认Runner/Broker/Runtime与CLI interactive仍Unavailable，Candidate不变。双向运行时签名/调用者身份、真实helper两行读协议与本机确认UI仍未接线，也未获得实机授权/网络写批准。
 
 ### macOS 恢复事务的两个入口
 

@@ -6,8 +6,14 @@ import AppKit
     let configuration: RuntimeConfiguration
     private(set) var exitSafety: EngineExitSafety
     var hasLaunchedOwnedEngine: Bool { exitSafety.hasLaunchedOwnedEngine }
-    var canExitWithoutLiveEngine: Bool { exitSafety.canExitWithoutLiveEngine(isolated: configuration.isolated) }
-    func recordVerifiedCleanup(instanceId: String) { exitSafety.recordVerifiedCleanup(instanceId: instanceId) }
+    var canExitWithoutLiveEngine: Bool { !hasActiveProxyHelper && exitSafety.canExitWithoutLiveEngine(isolated: configuration.isolated) }
+    @discardableResult func recordVerifiedCleanup(instanceId: String) -> Bool {
+        guard !hasActiveProxyHelper, hasLaunchedOwnedEngine,
+              instanceId == self.instanceId, exitSafety.launchId == instanceId,
+              process?.isRunning != true else { return false }
+        exitSafety.recordVerifiedCleanup(instanceId: instanceId)
+        return true
+    }
     var instanceId: String { client.lease.instanceId }
     var onTermination: (() -> Void)?
     private let resourcesDirectory: URL?
@@ -16,6 +22,13 @@ import AppKit
     func stateDirectoryURL() throws -> URL { try configuration.stateDirectory(applicationSupport: applicationSupportDirectory) }
     private var proxyBroker: NativeProxyBroker?
     private var proxyPipe: NativeProxyPipe?
+    // Pure liveness seam, never an authorization/reference injection.
+    var helperActivityCheck: (() -> Bool)?
+    var hasActiveProxyHelper: Bool { helperActivityCheck?() == true || proxyBroker?.hasActiveHelper == true }
+    func ensureProxyHelperInactive() async throws {
+        guard !hasActiveProxyHelper else { throw NativeProxyCodec.error("NATIVE_PROXY_UNKNOWN") }
+        try proxyBroker?.ensureHelperInactive()
+    }
     func performProxyAction(_ action: String) async throws {
         guard !configuration.isolated else { throw NativeProxyCodec.error("ISOLATED") }
         _ = try client.lease.authorize()
@@ -39,6 +52,7 @@ import AppKit
         self.resourcesDirectory = resourcesDirectory
     }
     func start() async throws {
+        try await ensureProxyHelperInactive()
         guard !starting else { throw APIError(message: "引擎正在启动，请稍后重试") }
         starting = true
         defer { starting = false }
@@ -82,6 +96,7 @@ import AppKit
         throw APIError(message: "引擎启动超时，请查看日志后重试；未强制终止进程")
     }
     private func launch() throws {
+        guard !hasActiveProxyHelper else { throw NativeProxyCodec.error("NATIVE_PROXY_UNKNOWN") }
         guard let resources = resourcesDirectory else { throw APIError(message: "应用资源缺失") }
         let engine = resources.appendingPathComponent("engine/jms-engine")
         let core = resources.appendingPathComponent("core/sing-box")
@@ -154,6 +169,8 @@ import AppKit
         catch { nativePipe?.close(); lease.revoke(instanceId: credentials.instanceId); transport.invalidateAndCancel(); throw error }
     }
     func stopOwnedProcess() async throws {
+        try await ensureProxyHelperInactive()
+        guard !hasActiveProxyHelper else { throw NativeProxyCodec.error("NATIVE_PROXY_UNKNOWN") }
         guard let process, process.isRunning else { self.process = nil; return }
         process.terminate()
         for _ in 0..<40 {

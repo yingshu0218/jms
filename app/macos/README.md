@@ -42,7 +42,7 @@ Go 模块代理不可达时可设置 `GOPROXY` 后重试。运行时、内核及
 `native-engine.log（隔离 Candidate 的启动日志位于随机临时文件）` 保存正式引擎启动输出；Candidate 的启动日志放在系统临时目录中的独立随机文件，不在 Node 获取锁与验证隔离标记之前写入状态目录。Candidate 目录检查拒绝正式目录的大小写别名及符号链接。用户订阅输入使用安全文本框。
 认证凭据受自有进程租约保护：普通请求需确认引擎身份且进程仍存活；进程结束立即撤销租约、取消传输，并停止轮询与事件重连。初次端口探测不携带凭据。首次身份握手前以只读 `/usr/sbin/lsof` 核对精确回环监听端口仅属于自有引擎 PID；归属未确认、检查失败或超时均不发送认证头。检查有两秒截止，超时只终止本次自有 lsof 辅助进程，不终止用户进程。
 
-退出时先禁止新的界面操作并等待已发出的操作完成，再请求引擎进入停止接收变更的状态并断开；确认内核停止且恢复日志已清除，才停止自己启动的引擎。
+退出时先禁止新的界面操作；若自有代理helper尚未确认退出则保留进程并拒绝本次退出。否则等待已发出的操作完成并再次核验helper，再请求引擎进入停止接收变更的状态并断开；确认内核停止且恢复日志已清除、自有helper不活跃，才停止自己启动的引擎并记录当前launch的清理证明。
 正式引擎一旦成功启动，即使尚未就绪就意外退出，也不能把进程不存在当作网络已恢复。未获得本次启动的关闭与状态复核结果时会阻止退出，并提供“重新启动并恢复”按钮，让新自有引擎按 journal 完成恢复；不直接删除 journal，也不强杀进程。恢复失败会保留进程、报告错误并允许重试；不复用或终止外部引擎。
 TUN 权限面板可独立于当前接管方式检查、复制引擎命令并重新检测；连接返回 NEED_ELEVATION 时自动显示。不包含特权辅助服务或 Apple PacketTunnel，也不会把整个 GUI 提权运行。当前认证模型不会自动接管手工提权启动的外部引擎；原生 TUN 提权衔接仍需独立设计与验证。
 
@@ -74,3 +74,21 @@ helper/authorizer remains unavailable. It does not make ordinary-user sysproxy
 usable yet. Pending Darwin journals keep a visible recovery-limited engine;
 background startup never opens an authorization dialog. See
 [the phased design and crash-recovery limits](../docs/native-proxy-authorization.md).
+
+### Source-only platform driver (not enabled)
+
+The fixed bundled-helper Process transport and typed authorization review are now
+implemented as unselected source. A review is one-shot and expires after thirty
+monotonic seconds; it exposes no raw proxy blob. The source transport uses a
+minimal environment and never kills a helper after commit permission may have
+been sent. Broker/Runtime still use Unavailable, Candidate still refuses begin,
+and helper CLI interactive is still hard-disabled. This is not a completed
+confirmation UI or an approved real authorization flow. New driver/review tests
+are fake-only; real prompts/Commit/Apply/crash windows need a separately approved
+isolated-Mac test.
+
+Fixed paths, bundle metadata and build-time codesign are not runtime trust.
+Native must verify the helper's running signing identity, and a future enabled
+helper must authenticate the requesting Native peer. Anonymous pipes or fresh
+authorization references alone do not provide that identity. These two activation
+blockers remain unresolved; no production route selects the source-only driver.
