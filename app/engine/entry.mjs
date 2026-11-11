@@ -8,6 +8,7 @@ import { DEFAULT_DIR } from './store.mjs';
 import { createAppServer } from './server.mjs';
 import { acquireLock } from './lock.mjs';
 import { newApiToken, checkApiToken } from './control-auth.mjs';
+import { attachNativeProxyControl } from './native-proxy.mjs';
 
 export async function runEngine({ argv = process.argv, env = process.env } = {}) {
   const argOf = (name, fallback) => {
@@ -21,6 +22,10 @@ export async function runEngine({ argv = process.argv, env = process.env } = {})
   const authToken = checkApiToken(env.JMS_API_TOKEN || newApiToken());
   const instanceId = env.JMS_INSTANCE_ID || randomUUID();
   const isolated = argv.includes('--isolated');
+  const nativeControl = argv.includes('--native-control');
+  // stdout is exclusively bounded private protocol in Native mode. Do not
+  // accidentally write logs (or raw recovery plans) into that stream.
+  const log = nativeControl ? console.error : console.log;
   const requestedDir = argOf('dir', undefined);
   if (isolated && !requestedDir) throw new Error('隔离实例必须显式指定独立空目录');
   const dir = resolve(requestedDir || DEFAULT_DIR);
@@ -30,8 +35,9 @@ export async function runEngine({ argv = process.argv, env = process.env } = {})
   if (!lock.ok) throw new Error('已有引擎拥有此状态目录，未复用、停止或覆盖该引擎');
   let app;
   let server;
+  let nativeBridge;
   try {
-    app = new AppService({ dir, coreBinary: argOf('core', undefined), isolated, controlPort: port });
+    app = new AppService({ dir, coreBinary: argOf('core', undefined), isolated, nativeControl, controlPort: port });
     app.ready = false;
     // 先绑定控制端口，碰到已有服务时绝不先自愈/修改宿主代理。
     server = createAppServer({ app, host, port, uiFile: argOf('ui', undefined), authToken, instanceId });
@@ -39,23 +45,25 @@ export async function runEngine({ argv = process.argv, env = process.env } = {})
     const healed = await app.boot();
     app.ready = true;
     app.startAutoRefresh();
-    if (healed.healed) console.log('[自愈] 已恢复上次未完成的系统代理设置');
+    if (healed.healed) log('[自愈] 已恢复上次未完成的系统代理设置');
     // CLI 凭据只落到用户自己的 0600 文件；不打印秘密或放进 URL。
     if (!env.JMS_API_TOKEN) {
       const file = join(app.dir, 'api-auth.json');
       writeFileSync(file, JSON.stringify({ authToken, instanceId }), { mode: 0o600 });
       chmodSync(file, 0o600);
     }
+    nativeBridge = nativeControl ? attachNativeProxyControl({app,launchId:instanceId,input:process.stdin,output:process.stdout}) : null;
   } catch (error) {
+    nativeBridge?.close();
     server?.close();
     lock.release();
     throw error;
   }
-  app.on('warn', message => console.log(`[警告] ${message}`));
-  app.on('connected', () => console.log('[已连接]'));
-  app.on('disconnected', () => console.log('[已断开]'));
-  console.log(`jms-client 引擎已启动 → http://${host}:${port}`);
-  console.log(app.isolated ? '[隔离] 禁止真实网络接管、提权与外部订阅' : '[就绪]');
+  app.on('warn', message => log(`[警告] ${message}`));
+  app.on('connected', () => log('[已连接]'));
+  app.on('disconnected', () => log('[已断开]'));
+  log(`jms-client 引擎已启动 → http://${host}:${port}`);
+  log(app.isolated ? '[隔离] 禁止真实网络接管、提权与外部订阅' : app.recoveryRequired ? '[等待明确恢复] 未自动修改系统代理' : '[就绪]');
   let closing;
   const shutdown = () => {
     if (closing) return closing;
@@ -64,6 +72,7 @@ export async function runEngine({ argv = process.argv, env = process.env } = {})
         await server.drain();
         server.closeAllConnections();
         server.close();
+        nativeBridge?.close();
         lock.release();
         process.exitCode = 0;
       } catch (error) {

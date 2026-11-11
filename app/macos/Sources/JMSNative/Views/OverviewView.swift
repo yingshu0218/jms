@@ -15,6 +15,17 @@ struct OverviewView: View {
             if !model.ready {
                 HStack { Text("引擎尚未就绪").foregroundStyle(.secondary); Spacer(); Button("重试启动") { model.start() } }
             }
+            if model.recoveryRequired {
+                GroupBox {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Label("系统代理等待明确恢复", systemImage: "exclamationmark.shield").font(.headline)
+                        Text("上次事务尚未证明恢复。没有在后台弹出授权，也没有删除原日志；内核若已退出，当前代理路径可能不可用。临时授权不能保证崩溃后自动恢复。")
+                            .font(.caption).foregroundStyle(.secondary)
+                        Button("准备授权并恢复系统代理") { model.recoverProxy() }
+                            .disabled(!model.canControlConnection)
+                    }.frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
             GroupBox {
                 HStack(spacing: 14) {
                     Image(systemName: connected ? "checkmark.shield.fill" : "network")
@@ -25,9 +36,9 @@ struct OverviewView: View {
                         Text(model.effectiveNodeName ?? (connected ? "当前节点未确认" : "添加订阅后选择一个节点")).foregroundStyle(.secondary).lineLimit(1)
                     }
                     Spacer(minLength: 6)
-                    Button(connected ? "断开连接" : "连接代理") { model.toggleConnection() }
+                    Button(model.recoveryRequired ? "恢复系统代理" : connected ? "断开连接" : "连接代理") { model.toggleConnection() }
                         .buttonStyle(.borderedProminent).controlSize(.large)
-                        .disabled(!model.ready || model.working || (!connected && nodeCount == 0))
+                        .disabled(!model.canControlConnection || (!model.recoveryRequired && !connected && nodeCount == 0))
                 }
                 if connected && model.snapshot?.settings.mode == "sysproxy" && model.snapshot?.status.pointingAtUs == false {
                     Label("系统代理未指向 JMS，可能被其他代理或 VPN 覆盖。", systemImage: "exclamationmark.triangle").font(.caption).foregroundStyle(.orange)
@@ -68,7 +79,7 @@ struct OverviewView: View {
                             Button("检查 TUN 权限") { model.showTunPermission = true }
                         }.buttonStyle(.borderless)
                     }
-                }.disabled(model.working || !model.ready)
+                }.disabled(!model.canSwitch)
             }
         }.frame(maxWidth: .infinity, alignment: .topLeading)
         }

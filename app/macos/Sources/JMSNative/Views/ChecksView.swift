@@ -14,7 +14,7 @@ struct ChecksView: View {
                     if model.checking { ProgressView().controlSize(.small); Text("正在检测…").foregroundStyle(.secondary) }
                     else { Text("检查常用站点的连通性").foregroundStyle(.secondary) }
                     Spacer()
-                    Button("开始检测") { model.checkLinks() }.buttonStyle(.borderedProminent).disabled(model.checking || !model.ready)
+                    Button("开始检测") { model.checkLinks() }.buttonStyle(.borderedProminent).disabled(model.checking || !model.canSwitch)
                 }.padding(.vertical, 5)
             }
             ScrollView {

@@ -10,7 +10,7 @@ struct MenuContent: View {
     }
     var body: some View {
         Button("显示主窗口") { MainWindowPresenter.shared.show() }
-        Button(model.snapshot?.status.connected == true ? "断开" : "连接") { model.toggleConnection() }.disabled(!model.canSwitch)
+        Button(model.recoveryRequired ? "恢复系统代理" : model.snapshot?.status.connected == true ? "断开" : "连接") { model.toggleConnection() }.disabled(!model.canControlConnection)
         Menu("节点") {
             if let snapshot = model.snapshot, !snapshot.subscription.nodes.isEmpty {
                 ForEach(snapshot.subscription.nodes.indices, id: \.self) { index in

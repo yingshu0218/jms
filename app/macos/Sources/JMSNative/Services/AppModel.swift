@@ -23,6 +23,9 @@ import SwiftUI
     @Published var switchNotice = ""
     @Published var checks = "尚未检测"
     let runtime: EngineRuntime
+    // Test injection never carries an authorization reference. Production only
+    // reaches the owned Runtime's private Native pipe from an explicit action.
+    var nativeProxyAction: ((String) async throws -> Void)?
     init(runtime: EngineRuntime? = nil) {
         self.runtime = runtime ?? EngineRuntime()
         self.runtime.onTermination = { [weak self] in
@@ -58,7 +61,9 @@ import SwiftUI
         start()
     }
     private var snapshotGate = SnapshotGate()
-    var canSwitch: Bool { ready && !working && !shuttingDown && snapshot?.status.busy == nil }
+    var recoveryRequired: Bool { snapshot?.status.recoveryRequired == true }
+    var canControlConnection: Bool { ready && !working && !shuttingDown && snapshot?.status.busy == nil }
+    var canSwitch: Bool { canControlConnection && !recoveryRequired }
     var effectiveSelection: Int? { effectiveTrusted && ready ? snapshot?.status.confirmedSelection : nil }
     var effectiveRoutingMode: String? { effectiveTrusted && ready ? snapshot?.status.confirmedMode : nil }
     var effectiveNodeName: String? {
@@ -68,6 +73,7 @@ import SwiftUI
     var selectionSummary: String {
         if selectionPending != nil || routingModePending != nil { return "正在确认切换…" }
         guard ready else { return "引擎离线，当前状态未知" }
+        if recoveryRequired { return "系统代理恢复尚未确认；仅可查看状态或明确发起恢复，原日志已保留" }
         if snapshot?.status.busy == "recovering" { return "内核正在恢复，当前生效状态尚未确认" }
         if snapshot?.status.running != true {
             guard let snapshot else { return "正在加载状态" }
@@ -89,8 +95,8 @@ import SwiftUI
         snapshot = result
         effectiveTrusted = true
     }
-    func perform(label: String = "正在执行操作", command: String = "本地引擎请求", _ action: @escaping () async throws -> Void) {
-        guard canSwitch else { return }
+    func perform(label: String = "正在执行操作", command: String = "本地引擎请求", allowRecovery: Bool = false, _ action: @escaping () async throws -> Void) {
+        guard (allowRecovery ? canControlConnection : canSwitch) else { return }
         working = true; workingTitle = label; workingCommand = command; workingStarted = Date()
         snapshotGate.invalidate(); effectiveTrusted = false
         let switching = selectionPending != nil || routingModePending != nil
@@ -129,7 +135,15 @@ import SwiftUI
     func post(_ path: String, _ body: [String: Any] = [:]) {
         if path == "api/routing-mode", let mode = body["mode"] as? String { setRoutingMode(mode); return }
         if path == "api/node", let index = body["index"] as? Int { setNode(index); return }
-        perform(label: path == "api/connect" ? "正在连接代理" : path == "api/disconnect" ? "正在恢复系统网络设置" : "正在执行操作", command: "POST /" + path) {
+        let restoring = path == "api/disconnect"
+        let nativeProxy = !runtime.configuration.isolated && (path == "api/connect" || restoring) &&
+            (snapshot?.settings.mode == "sysproxy" || (restoring && snapshot?.status.pendingProxyJournal == true))
+        perform(label: path == "api/connect" ? "准备授权并连接代理" : restoring ? "准备授权并恢复系统代理" : "正在执行操作",
+                command: nativeProxy ? "原生私有系统代理事务" : "POST /" + path, allowRecovery: restoring) {
+            if nativeProxy {
+                try await self.runNativeProxyAction(restoring ? "disconnect" : "connect")
+                return
+            }
             let data = try await self.client.request(path, body: body)
             if let result = try JSONSerialization.jsonObject(with: data) as? [String: Any], let reason = result["reason"] as? String {
                 self.logs.append(reason)
@@ -162,7 +176,12 @@ import SwiftUI
         switchValue(path: "api/routing-mode", body: ["mode": mode])
     }
     func settings(_ patch: [String: Any]) { post("api/settings", ["settings": patch]) }
-    func toggleConnection() { post(snapshot?.status.connected == true ? "api/disconnect" : "api/connect") }
+    func toggleConnection() { post(recoveryRequired || snapshot?.status.connected == true ? "api/disconnect" : "api/connect") }
+    func recoverProxy() { post("api/disconnect") }
+    private func runNativeProxyAction(_ action: String) async throws {
+        if let nativeProxyAction { try await nativeProxyAction(action) }
+        else { try await runtime.performProxyAction(action) }
+    }
     func saveRules(_ rules: [Rule]) {
         perform {
             let data = try JSONEncoder().encode(rules)
@@ -185,7 +204,7 @@ import SwiftUI
         }
     }
     func checkLinks() {
-        guard !checking, !shuttingDown else { return }; checking = true
+        guard ready, !checking, !shuttingDown, !working, !recoveryRequired else { return }; checking = true
         checkingTask = Task {
             defer { checking = false; checkingTask = nil }
             do {
@@ -248,12 +267,18 @@ import SwiftUI
         if runtime.process?.isRunning != true {
             if runtime.canExitWithoutLiveEngine { return true }
             shuttingDown = false
-            shutdownError = "引擎已退出，无法确认系统代理已恢复。请点击“重新启动并恢复”，完成恢复后再退出。"
+            shutdownError = "引擎已退出，无法确认系统代理已恢复。请点击“重新启动并检查恢复”，明确完成恢复后再退出。"
             error = shutdownError
             return false
         }
         let shutdownInstanceId = runtime.instanceId
         do {
+            // Quit is an explicit recovery action, not permission for a silent
+            // background prompt. Cancellation/unknown returns false below and
+            // leaves the core, engine and journal available for manual recovery.
+            if !runtime.configuration.isolated, snapshot?.status.pendingProxyJournal == true {
+                try await runNativeProxyAction("disconnect")
+            }
             _ = try await client.request("api/shutdown", body: [:])
             try await ShutdownCoordinator.run(
                 status: { try await self.client.snapshot().status },

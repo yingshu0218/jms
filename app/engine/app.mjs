@@ -30,10 +30,12 @@ const emptyEffective = () => ({ selected: null, routingMode: null, node: null, s
 const canonicalMode = value => typeof value === 'string' && ROUTING_MODES.includes(value.trim().toLowerCase()) ? value.trim().toLowerCase() : null;
 
 export class AppService extends EventEmitter {
-  constructor({ dir, coreBinary, adapter, clashApiFactory, latencyCoreRunner = withLatencyCore, isolated = false, controlPort = 7788, supervisorFactory, portsAvailable = assertPortsAvailable, ruleSetProvider = ensureRuleSets, listenerOwnership = assertListenerOwnership } = {}) {
+  constructor({ dir, coreBinary, adapter, clashApiFactory, latencyCoreRunner = withLatencyCore, isolated = false, nativeControl = false, controlPort = 7788, supervisorFactory, portsAvailable = assertPortsAvailable, ruleSetProvider = ensureRuleSets, listenerOwnership = assertListenerOwnership } = {}) {
     super();
     this.isolated = isolated;
     this.controlPort = controlPort;
+    this.nativeControl = nativeControl;
+    this.recoveryRequired = false;
     this.draining = false;
     this.portsAvailable = portsAvailable;
     this.ruleSetProvider = ruleSetProvider;
@@ -83,6 +85,7 @@ export class AppService extends EventEmitter {
 
   assertMutable() {
     if (this.draining) throw Object.assign(new Error('引擎正在退出，暂停新操作'), { code: 'DRAINING' });
+    if (this.recoveryRequired) throw Object.assign(new Error('系统代理恢复尚未确认，请先通过明确的恢复操作处理；原日志已保留'), { code: 'RECOVERY_REQUIRED' });
   }
 
   assertNetworkAllowed() {
@@ -209,7 +212,8 @@ export class AppService extends EventEmitter {
       mode: active.mode, port: active.port, node: effective.node, nodeCount: s.subscription.nodes.length,
       pointingAtUs, pendingProxyJournal: this.journal.isPending(), coreBinary: this.coreBinary,
       busy: this.busy || (this.supervisor && !this.sessionReady ? 'recovering' : null),
-      sessionId: this.sessionId, effective, persistenceError: this.persistenceError };
+      sessionId: this.sessionId, effective, persistenceError: this.persistenceError,
+      recoveryRequired: this.recoveryRequired };
   }
 
   /** 给 API / UI 的脱敏快照 */
@@ -263,7 +267,12 @@ export class AppService extends EventEmitter {
 
   // ── 启动自愈 ───────────────────────────────────────────────────────────
   async boot() {
-    const healed = await healIfNeeded({ adapter: this.adapter, journal: this.journal });
+    // A short-lived authorization cannot promise unattended crash recovery.
+    // Never try an interactive path in boot, and never close the only control
+    // endpoint just because an old/corrupt journal needs human recovery.
+    const limited = !this.isolated && this.adapter.platform === 'darwin' && this.journal.isPending();
+    this.recoveryRequired = limited;
+    const healed = limited ? { healed: false, recoveryRequired: true } : await healIfNeeded({ adapter: this.adapter, journal: this.journal });
     if (healed.healed) {
       this.emit('healed', healed);
       if (healed.platformMismatch) {
@@ -286,7 +295,7 @@ export class AppService extends EventEmitter {
 
   /** 订阅自动刷新（服务端参数轮换时的兜底） */
   startAutoRefresh({ intervalMs } = {}) {
-    if (this.draining || this.isolated) return null;
+    if (this.draining || this.isolated || this.recoveryRequired) return null;
     const every = intervalMs ?? this.store.state.settings.autoRefreshMinutes * 60_000;
     if (this.refreshTimer) clearInterval(this.refreshTimer);
     if (!every || every <= 0) return null;
@@ -296,7 +305,7 @@ export class AppService extends EventEmitter {
   }
 
   async autoRefreshSubscriptions() {
-    if (this.draining || this.isolated || this.autoRefreshing || this.busy || !this.store.state.profiles.length) return;
+    if (this.draining || this.isolated || this.recoveryRequired || this.autoRefreshing || this.busy || !this.store.state.profiles.length) return;
     this.autoRefreshing = true;
     try {
       const result = await this.profiles.refreshAll({ background: true });
@@ -433,11 +442,14 @@ export class AppService extends EventEmitter {
   }
 
   // ── 连接 / 断开 ────────────────────────────────────────────────────────
-  async connect() {
+  async connect({ proxyAdapter } = {}) {
     this.assertNetworkAllowed();
     if (this.busy) throw new Error(`正在执行：${this.busy}`);
     // 对旧状态同样先验证，不能在下载、提权或生成文件后才发现非法模式/地址。
     this.validatedSettings();
+    if (this.nativeControl && this.adapter.platform === 'darwin' && this.store.state.settings.mode === 'sysproxy' && !proxyAdapter) {
+      throw Object.assign(new Error('系统代理需要原生界面中的明确授权操作；普通HTTP请求不会弹出系统授权'), { code: 'SYS_PROXY_AUTHORIZATION_REQUIRED' });
+    }
     if (this.supervisor?.isRunning() && this.store.state.runtime.connected) return { connected: true, alreadyConnected: true, pid: this.supervisor.status().pid };
     // 有恢复日志/旧会话时只能先断开，不能覆盖原始快照或失去旧进程的所有权。
     if (this.supervisor || this.store.state.runtime.connected || this.journal.isPending()) throw new Error('仍有未清理的连接，请先断开或恢复后重试');
@@ -494,7 +506,8 @@ export class AppService extends EventEmitter {
       // 系统代理模式才需要改系统设置；TUN 模式由内核接管流量
       if (settings.mode === 'sysproxy') {
         this.emit('operation-progress', { stage: '配置系统 HTTP / HTTPS 代理（每条命令最多10秒）', command: 'networksetup <系统代理设置，参数已隐藏>' });
-        await enableProxy({ adapter: this.adapter, journal: this.journal, port: settings.port });
+        await enableProxy({ adapter: proxyAdapter || this.adapter, journal: this.journal, port: settings.port });
+        await proxyAdapter?.assertCurrent?.();
       }
 
       this.store.markRuntime({
@@ -514,15 +527,17 @@ export class AppService extends EventEmitter {
     }
   }
 
-  async disconnect() {
+  async disconnect({ proxyAdapter } = {}) {
     if (this.busy) throw new Error(`正在执行：${this.busy}`);
     this.busy = 'disconnect';
     try {
       // 顺序不可颠倒：先还原系统代理（恢复用户网络），再停内核
       let proxyRestore = null;
       if (this.journal.isPending()) {
-        proxyRestore = await disableProxy({ adapter: this.adapter, journal: this.journal });
+        if (this.nativeControl && this.adapter.platform === 'darwin' && !proxyAdapter) throw Object.assign(new Error('恢复系统代理需要原生界面的明确用户操作；恢复日志已保留'), { code: 'SYS_PROXY_AUTHORIZATION_REQUIRED' });
+        proxyRestore = await disableProxy({ adapter: proxyAdapter || this.adapter, journal: this.journal });
       }
+      this.recoveryRequired = false;
       await this.supervisor?.stop();
       this.supervisor?.closeLog();
       this.supervisor = null;
@@ -534,9 +549,28 @@ export class AppService extends EventEmitter {
       this.profiles.applyPending();
       this.emit('disconnected', proxyRestore);
       return proxyRestore;
+    } catch (error) {
+      if (this.nativeControl && this.adapter.platform === 'darwin' && this.journal.isPending()) this.recoveryRequired = true;
+      throw error;
     } finally {
       this.busy = null;
     }
+  }
+
+  // Captured once per explicit Native operation. Waiting in a system
+  // authorization window must not permit a dead/replaced core to be adopted.
+  nativeProxyGuard(action) {
+    let token;
+    return async () => {
+      if (!this.nativeControl || this.isolated || this.adapter.platform !== 'darwin') throw Object.assign(new Error('原生系统代理操作不可用'), { code: this.isolated ? 'ISOLATED' : 'SYS_PROXY_AUTHORIZATION_REQUIRED' });
+      if (action !== 'connect') return;
+      token ||= this.#sessionToken();
+      this.#assertSession(token);
+      if (!this.sessionReady) throw Object.assign(new Error('本次内核尚未就绪'), { code: 'STALE_SESSION' });
+      const settings = this.sessionSettings;
+      await this.listenerOwnership([settings.port,Number(settings.clashApi.split(':').at(-1))],token.pid);
+      this.#assertSession(token);
+    };
   }
 
   /**
@@ -625,6 +659,10 @@ export class AppService extends EventEmitter {
   async #safeTeardown() {
     try {
       if (this.journal.isPending()) {
+        if (this.nativeControl && this.adapter.platform === 'darwin') {
+          this.recoveryRequired = true;
+          throw Object.assign(new Error('事务结果尚未收敛，保留内核与日志等待明确恢复'), { code: 'RECOVERY_REQUIRED' });
+        }
         await healIfNeeded({ adapter: this.adapter, journal: this.journal });
       }
     } catch (error) {
@@ -669,6 +707,10 @@ export class AppService extends EventEmitter {
       try {
         try {
           if (this.journal.isPending()) {
+            if (this.nativeControl && this.adapter.platform === 'darwin') {
+              this.recoveryRequired = true;
+              throw Object.assign(new Error('内核已停止；系统代理需要用户明确恢复，不能保证当前网络仍可用'), { code: 'RECOVERY_REQUIRED' });
+            }
             await disableProxy({ adapter: this.adapter, journal: this.journal });
             this.emit('warn', '已还原系统代理设置');
           }

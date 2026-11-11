@@ -63,7 +63,7 @@ struct SiteRulesView: View {
                 }.buttonStyle(.borderedProminent).disabled(rule.value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
             Text(notice).font(.caption).foregroundStyle(.secondary)
-        }.disabled(model.working || !model.ready || readingImport)
+        }.disabled(!model.canSwitch || readingImport)
         .fileImporter(isPresented: $importing, allowedContentTypes: [.json]) { result in
             guard !readingImport else { return }
             readingImport = true

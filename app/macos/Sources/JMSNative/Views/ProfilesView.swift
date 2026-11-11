@@ -71,7 +71,7 @@ struct ProfilesView: View {
                     }
                 }
             }
-        }.disabled(model.working || !model.ready)
+        }.disabled(!model.canSwitch)
         .confirmationDialog("删除订阅“\(deleting?.name ?? "")”？个人分流规则会保留。", isPresented: Binding(get: { deleting != nil }, set: { if !$0 { deleting = nil } })) {
             Button("删除订阅", role: .destructive) {
                 guard let id = deleting?.id else { return }; deleting = nil

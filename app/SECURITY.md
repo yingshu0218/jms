@@ -68,3 +68,9 @@
 ## 本轮验证边界（2026-11-11）
 
 Linux 隔离回归通过不等于 macOS 构建或真机网络验证。首批 `da548b1` 的双架构 Swift/构建/固定内核配置门禁实际通过，不能沿用为后续代码的证据。没有修改任何真实系统代理/TUN/路由，没有提权或使用真实订阅，也没有发布、部署或公证。真实网络恢复路径仍需另行验证后才可接触真实凭据。日常 `verify.sh` 不执行真实接管；显式 opt-in 内核流量回归只访问回环 fixtures，移除 TUN 入站。
+
+### 交互式系统代理原型（尚未启用真实权限）
+
+Native一次性动作门与自有Node匿名pipe分开于HTTP Bearer。原始恢复plan只走私管道/0600 WAL；Node先fsync才发一次commit许可，失败后不重放。默认provider/driver及CLI interactive仍拒绝创建权限引用，Candidate双重拒绝。未来正式授权必须有由typed plan生成的本机明确确认，不能把HTTP userInitiated布尔或OS缓存密码框当授权证明。
+
+Darwin残留journal启动limited-ready，不在boot/giveup/signal/自动刷新弹授权框。提交许可后取消/EOF/超时都保留unknown、journal与owned core；未知未收敛不允许新连接。Native新路径暂不支持旧schema交互恢复，绝不改走networksetup兜底。临时授权不保证无人值守崩溃恢复；所有真实权限/Commit/Apply/鉴权/VPN语义仍需另行获批实机门禁，见docs/native-proxy-authorization.md。

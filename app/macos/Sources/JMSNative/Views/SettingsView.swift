@@ -43,7 +43,7 @@ struct SettingsView: View {
                 }.buttonStyle(.borderedProminent).controlSize(.large).disabled(!draft.loaded || !draft.dirty)
             }
         }.textFieldStyle(.roundedBorder).groupBoxStyle(SoftGroupBoxStyle()).padding(26)
-            .disabled(model.working || !model.ready || !draft.loaded)
+            .disabled(!model.canSwitch || !draft.loaded)
             .onAppear { if let settings = model.snapshot?.settings { draft.receive(settings) } }
             .onChange(of: sourceVersion) { _ in if let settings = model.snapshot?.settings { draft.receive(settings) } }
     }

@@ -16,6 +16,7 @@ public enum CommitState: Equatable, Codable {
 }
 public enum FailureCode: String, Codable {
     case authorizationRequired = "AUTHORIZATION_REQUIRED"
+    case cancelled = "CANCELLED", commitPermissionTimeout = "COMMIT_PERMISSION_TIMEOUT"
     case conflict = "CONFLICT", commitFailed = "COMMIT_FAILED", applyFailed = "APPLY_FAILED", readbackFailed = "READBACK_FAILED", unsupported = "UNSUPPORTED_CONFIG", invalidRequest = "INVALID_REQUEST"
 }
 public struct Failure: Error, Encodable {

@@ -67,11 +67,11 @@ struct ContentView: View {
             ToolbarItem(placement: .automatic) {
             if model.working || model.startingEngine { ProgressView().controlSize(.small) }
             if !model.ready {
-                Button("重新启动并恢复") { model.retryEngineRecovery() }
-                    .help("启动自有引擎，按恢复日志恢复网络设置；不会强杀进程或直接删除恢复日志")
+                Button("重新启动并检查恢复") { model.retryEngineRecovery() }
+                    .help("启动自有引擎并显示待恢复状态；恢复需要明确操作，不会强杀进程或删除日志")
                     .disabled(model.startingEngine || model.shuttingDown || model.working || model.checking)
             }
-            Button(model.snapshot?.status.connected == true ? "断开" : "连接", systemImage: "power") { model.toggleConnection() }.labelStyle(.titleAndIcon).help("连接或断开代理").disabled(!model.ready || model.working)
+            Button(model.recoveryRequired ? "恢复系统代理" : model.snapshot?.status.connected == true ? "断开" : "连接", systemImage: "power") { model.toggleConnection() }.labelStyle(.titleAndIcon).help(model.recoveryRequired ? "明确检查并恢复系统代理" : "连接或断开代理").disabled(!model.canControlConnection)
             }
         }
         .frame(width: geometry.size.width, height: geometry.size.height)

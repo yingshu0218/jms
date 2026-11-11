@@ -154,6 +154,16 @@ jobs:
           swift test --package-path app/macos --filter NativeIPCSmokeTests/testBundledIsolatedEngineLifecycle 2>&1 | tee app/build/ci/native-ipc-smoke.log
           grep -Eq 'Executed 1 test, with 0 failures' app/build/ci/native-ipc-smoke.log
           if grep -Eiq 'test.*skipped|skipped.*test' app/build/ci/native-ipc-smoke.log; then exit 1; fi
+      - name: Native private pipe smoke (isolated SEA refuses authorization)
+        timeout-minutes: 3
+        env:
+          JMS_NATIVE_IPC_SMOKE: '1'
+        run: |
+          set -o pipefail
+          export JMS_NATIVE_IPC_BUNDLE="$PWD/app/dist/JMS Client Candidate.app"
+          swift test --package-path app/macos --filter NativeControlPipeSmokeTests/testPrivatePipeToIsolatedBundledSEA 2>&1 | tee app/build/ci/native-control-pipe-smoke.log
+          grep -Eq 'Executed 1 test, with 0 failures' app/build/ci/native-control-pipe-smoke.log
+          if grep -Eiq 'test.*skipped|skipped.*test' app/build/ci/native-control-pipe-smoke.log; then exit 1; fi
       - name: Archive Candidate only (not a release)
         env:
           ARCH: ${{ matrix.arch }}
@@ -164,7 +174,8 @@ jobs:
             echo '### Executed macOS gates'
             echo "Checkout: $GITHUB_SHA / architecture: $ARCH"
             echo 'Swift tests, isolated Node tests, fixed 1.14.3 configuration checks, loopback-only traffic regressions, native Candidate assembly and signature checks completed.'
-            echo 'The SEA smoke is isolated; no GUI, real subscription, system proxy, TUN, elevation, routing change, notarization or deployment was exercised.'
+            echo 'Source Runtime/Client lifecycle and real private-pipe isolation-refusal smokes executed against the isolated SEA, not the packaged GUI.'
+            echo 'No real subscription, system proxy, TUN, elevation, routing change, notarization or deployment was exercised.'
             echo 'macOS 13 runtime compatibility is NOT established by deployment-target checks.'
           } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

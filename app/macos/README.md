@@ -66,3 +66,11 @@ TUN 权限面板可独立于当前接管方式检查、复制引擎命令并重�
 节点与路由以引擎读回的 effective 为“当前”，desired只用于下次连接。运行中切换统一串行，失败或未知允许同目标重试，立即获取新快照；旧请求序号或旧引擎租约的回包不覆盖当前状态。设置在快照载入后才能编辑，刷新不覆盖未保存草稿；规则文件在后台有界读取128KiB+1，超限或非法UTF-8整批拒绝。
 
 新增显式真实IPC smoke见TESTING：源码Runtime/Client实际启动随包隔离SEA，两次launch、无凭据占端口拒绝、SSE握手、退出复核及能力轮换；不启动打包GUI、不执行helper/core、不访问外部订阅。它当前仍须新CI实际编译执行，不沿用669602b的结果。
+
+### Interactive proxy protocol prototype
+
+The fourth-stage private pipe/Gate/transaction model is present, but its default
+helper/authorizer remains unavailable. It does not make ordinary-user sysproxy
+usable yet. Pending Darwin journals keep a visible recovery-limited engine;
+background startup never opens an authorization dialog. See
+[the phased design and crash-recovery limits](../docs/native-proxy-authorization.md).

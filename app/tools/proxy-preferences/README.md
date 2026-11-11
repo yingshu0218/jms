@@ -31,3 +31,24 @@ must pass restricted macOS CI before adoption. No live-system test was performed
 The missing non-root authorization path, actual Apply behavior, Keychain-only authentication
 detection, and VPN/no-device compatibility remain live-use gates. Rejecting known
 authentication/unknown keys is not proof that every authentication form is detected.
+
+### Interactive transaction model (not an authorization implementation)
+
+`InteractiveTransactionRunner` is a single-use, injected model: exact plan bytes
+are SHA-256 bound (including the apply plan’s pre-authorization expected
+snapshot), a locked CAS recheck rejects changes during the authorization wait.
+A locked prepare precedes a five-second durable-journal ACK,
+and only the matching ACK permits staging/Commit/Apply plus two readbacks. Its
+transport callback must enforce the supplied monotonic deadline; the model also
+rejects late callbacks. Tests use only `MemoryStore` and fake authorization.
+The only supplied provider is `UnavailableInteractiveAuthorization`.
+`--interactive` deliberately returns `AUTHORIZATION_REQUIRED` without creating
+an authorization reference. No privilege helper, permission prompt, or system
+write is enabled by this model. A platform authorizer and bounded private-pipe
+adapter require a separate audit and actual isolated-Mac validation.
+
+`observe` uses two fresh **read-only** SCPreferences sessions and validates/copies
+the raw `NetworkServices` dictionaries. It does not lock, authorize, commit, or
+apply. Equal observations are only a stable candidate, never a transactional
+snapshot or a guarantee against changes after the samples. Tests inject reads
+and never observe the host's actual preferences.

@@ -36,6 +36,6 @@ struct ApplicationRulesView: View {
                 Text("当前接管：\(settings.mode == "tun-per-app" ? "按应用 TUN" : "系统代理")。设置自动保存；切换后重新连接生效。").font(.caption).foregroundStyle(.secondary)
             }
             Spacer(minLength: 0)
-        }.disabled(model.working || !model.ready)
+        }.disabled(!model.canSwitch)
     }
 }

@@ -43,6 +43,29 @@ JMS_NATIVE_IPC_SMOKE=1 JMS_NATIVE_IPC_BUNDLE="$PWD/app/dist/JMS Client Candidate
 ```
 普通Swift测试不编入该opt-in target，缺配置不能记为smoke通过。CI要求实际执行1项、0失败、0跳过。该测试使用源码EngineRuntime/EngineClient与随包SEA，非打包JMSNative主程序/GUI：真实lsof/身份/认证state与SSE握手、设置读回、占端口无凭据拒绝、两次自有启动/退出与令牌轮换。仅临时目录和回环HTTP；不运行helper/core、不使用订阅、不改系统代理/TUN。临时假正式目录哨兵必须逐字不变，状态/日志不进入产物。控制通道URLSession显式使用非nil空proxy字典并禁止cookie/凭据存储，不继承系统代理，未修改系统设置。
 
+### 第三批实际 CI 与计时夹具修复
+
+`60ef1e8` 的[独立分支 CI](https://github.com/yingshu0218/jms/actions/runs/43075272183)实际全绿：两架构各63项Native、14项helper，Node549总/538通过/11跳过，27配置、16正/10负规则、8项SS回环与1项真实Runtime→SEA烟测均执行通过。
+
+同SHA合入后的[main补跑](https://github.com/yingshu0218/jms/actions/runs/43077591850) **不是通过结果**：ARM成功；Intel的35ms abort-ignoring GET夹具断言1次GET，实测0次。重负载下生产总截止已在PATCH后、GET前耗尽，安全返回未确认；该次后续core/打包/IPC因依赖失败跳过。没有把这些跳过计成通过。
+
+独立两文件修复 `d4f40ca`（与本地元数据提交3391f29同tree993bece）保留真实timer/AbortController和所有状态确认断言，仅提供内部单调时钟依赖，令夹具确定进入待测GET/text阶段；另明确验证PATCH耗尽截止→0GET仍未确认。其[准确SHA的完整CI](https://github.com/yingshu0218/jms/actions/runs/43082226510)已实际全绿：两架构各63/14项Swift、Node550总/539通过/11跳过、27配置、16正/10负规则、8项实际SS回环与1项Runtime IPC烟测均通过，Candidate架构/签名/组装通过。不是重跑旧红项掩盖失败。
+
+### 第四批：私有交互协议的受限原型
+
+本地Linux最终完整Node574项：563通过、0失败、11明确跳过；新增24项focused也实际通过。本批不创建真实AuthorizationRef。默认Native driver、helper provider和 `--interactive` CLI均为Unavailable。新增声明为31项普通Native模型测试、18项helper纯内存/观察模型测试；Linux环境没有Swift编译/执行证据，仍须本批新SHA的CI。详见[分阶段设计、临时授权局限和后续实机门禁](docs/native-proxy-authorization.md)。
+
+Node新增夹具只用临时目录、假SC/authorizer/进程与自有隔离Node child，覆盖WAL失败零commit、当前session/PID变化、提交后失联保journal/core、两次独立恢复观察失败及同值重试、旧Native日志不降级networksetup、Candidate与普通HTTP伪手势拒绝。Darwin pending journal启动limited-ready、不自动授权或关闭控制入口；不是已恢复网络。
+
+除保留原Runtime Candidate烟测，新增独立的真实匿名pipe烟测：
+
+```bash
+JMS_NATIVE_IPC_SMOKE=1 JMS_NATIVE_IPC_BUNDLE="$PWD/app/dist/JMS Client Candidate.app" \
+  swift test --package-path app/macos --filter NativeControlPipeSmokeTests/testPrivatePipeToIsolatedBundledSEA
+```
+
+CI要求该项实际执行1项、0失败、0跳过。测试控制器通过真实NativeProxyPipe/Broker连接随包SEA；SEA始终 `--isolated --native-control`，必须拒绝begin且helper计数0。发送Bearer前核对真实owned PID监听，确认身份/空订阅/无journal、前后状态及假正式目录sentinel不变，认证shutdown后保持父pipe直到自有child正常退出并收到EOF；watchdog清理不计成功。未调用真实helper/core/授权，没有把Runtime改为非隔离；该项不是正式系统代理、非隔离授权或GUI验收。当前该新增项仍待本批CI实际运行。
+
 ### macOS 恢复事务的两个入口
 
 原生包新增不提权的 `JMSProxyPreferences` helper，使用固定服务 UUID 路径、`SCPreferencesLock`、全服务 compare-and-set、一次 Commit/Apply 与持久状态读回。原始 Proxies plist 区分不存在、空字典和已停用的旧地址，私有 IPC 与0600 journal不输出原始字典。Swift helper 测试只注入内存存储，Node 只注入 fake IPC；绝不将 CLI 的 compareAndSet 当作测试运行。

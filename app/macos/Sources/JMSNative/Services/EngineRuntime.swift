@@ -14,6 +14,14 @@ import AppKit
     private let applicationSupportDirectory: URL
     let isolatedLogDirectory: URL
     func stateDirectoryURL() throws -> URL { try configuration.stateDirectory(applicationSupport: applicationSupportDirectory) }
+    private var proxyBroker: NativeProxyBroker?
+    private var proxyPipe: NativeProxyPipe?
+    func performProxyAction(_ action: String) async throws {
+        guard !configuration.isolated else { throw NativeProxyCodec.error("ISOLATED") }
+        _ = try client.lease.authorize()
+        guard let proxyBroker else { throw NativeProxyCodec.error("AUTHORIZATION_REQUIRED") }
+        try await proxyBroker.perform(action: action)
+    }
     private var starting = false
     private let listenerChecker: (Int32, Int) async throws -> Bool
     init(client: EngineClient? = nil, resourcesDirectory: URL? = Bundle.main.resourceURL,
@@ -93,6 +101,10 @@ import AppKit
         if !FileManager.default.fileExists(atPath: logfile.path) { FileManager.default.createFile(atPath: logfile.path, contents: nil, attributes: [.posixPermissions: 0o600]) }
         let log = try FileHandle(forWritingTo: logfile); try log.seekToEnd()
         defer { try? log.close() }
+        proxyPipe?.close()
+        let previousBroker = proxyBroker
+        Task { await previousBroker?.revoke() }
+        proxyBroker = nil; proxyPipe = nil
         let p = Process(); p.executableURL = engine
         p.arguments = ["--dir", dir.path, "--port", String(configuration.apiPort), "--core", core.path, "--ui", resources.appendingPathComponent("ui/index.html").path]
         if configuration.isolated { p.arguments?.append("--isolated") }
@@ -101,11 +113,25 @@ import AppKit
         // Never reuse an invalidated transport from an earlier launch.
         client.session = EngineControlSession.make()
         let transport = client.session
+        let nativePipe: NativeProxyPipe?
+        if configuration.isolated { nativePipe = nil } else { nativePipe = try NativeProxyPipe() }
+        if let nativePipe {
+            p.arguments?.append("--native-control")
+            p.standardInput = nativePipe.childInput
+            p.standardOutput = nativePipe.childOutput
+            proxyPipe = nativePipe
+            proxyBroker = NativeProxyBroker(isolated: configuration.isolated, launchId: credentials.instanceId,
+                isAlive: { [weak p] in p?.isRunning == true && lease.instanceId == credentials.instanceId },
+                sendFrame: { frame in try await nativePipe.send(frame) })
+        }
+        let nativeBroker = proxyBroker
         p.terminationHandler = { [weak self] _ in
             lease.revoke(instanceId: credentials.instanceId)
             transport.invalidateAndCancel()
             Task { @MainActor [weak self] in
                 guard let self, self.instanceId == credentials.instanceId else { return }
+                self.proxyPipe?.close()
+                await nativeBroker?.revoke()
                 self.onTermination?()
             }
         }
@@ -114,14 +140,18 @@ import AppKit
         environment["JMS_API_TOKEN"] = credentials.token
         environment["JMS_INSTANCE_ID"] = credentials.instanceId
         p.environment = environment
-        p.standardOutput = log; p.standardError = log
+        if nativePipe == nil { p.standardOutput = log }
+        p.standardError = log
         do {
             try p.run()
             process = p
+            if let nativePipe, let nativeBroker {
+                nativePipe.start(receive: { await nativeBroker.receive($0) }, ended: { await nativeBroker.revoke() })
+            }
             // Boot can already touch a recovery journal before identity becomes ready.
             exitSafety.recordLaunch(instanceId: credentials.instanceId)
         }
-        catch { lease.revoke(instanceId: credentials.instanceId); transport.invalidateAndCancel(); throw error }
+        catch { nativePipe?.close(); lease.revoke(instanceId: credentials.instanceId); transport.invalidateAndCancel(); throw error }
     }
     func stopOwnedProcess() async throws {
         guard let process, process.isRunning else { self.process = nil; return }

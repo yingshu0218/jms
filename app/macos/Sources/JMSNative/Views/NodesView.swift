@@ -35,7 +35,7 @@ struct NodesView: View {
             HStack {
                 Text("\(nodes.count) 个节点 · 单击查看，双击切换").font(.caption).foregroundStyle(.secondary)
                 Spacer()
-                Button("全部测速") { model.measure() }.disabled(model.working || !model.ready || (model.snapshot?.subscription.nodes.isEmpty ?? true))
+                Button("全部测速") { model.measure() }.disabled(!model.canSwitch || (model.snapshot?.subscription.nodes.isEmpty ?? true))
             }
             List(selection: $inspected) {
                 ForEach(nodes, id: \.0) { index, node in
@@ -50,7 +50,7 @@ struct NodesView: View {
                         .contextMenu {
                             Button("查看详情") { inspected = index; showingInfo = true }
                             Button("切换到此节点") { switchNode(index) }.disabled(!model.canSwitch)
-                            Button("测试延迟") { model.measure(index) }.disabled(model.working || !model.ready)
+                            Button("测试延迟") { model.measure(index) }.disabled(!model.canSwitch)
                         }
                 }
             }.listStyle(.plain).softListSurface()

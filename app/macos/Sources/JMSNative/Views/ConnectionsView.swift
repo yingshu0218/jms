@@ -17,7 +17,7 @@ struct ConnectionsView: View {
                 Spacer()
                 Button("刷新") { Task { await refresh() } }.disabled(!model.ready)
                 Button("关闭全部", role: .destructive) { confirmCloseAll = true }
-                    .disabled(closing || data?.connections.isEmpty != false)
+                    .disabled(!model.canSwitch || closing || data?.connections.isEmpty != false)
             }
             HStack {
                 Text("累计上传 \(ConnectionInfo.bytes(data?.uploadTotal))")
@@ -56,7 +56,7 @@ struct ConnectionsView: View {
                     Text("仅显示活动连接；累计流量由内核提供，重启后重置。").font(.caption).foregroundStyle(.secondary)
                     Spacer()
                     Button("关闭所选连接", role: .destructive) { Task { await close(all: false) } }
-                        .disabled(closing || selected == nil || !rows.contains(where: { $0.id == selected }))
+                        .disabled(!model.canSwitch || closing || selected == nil || !rows.contains(where: { $0.id == selected }))
                 }
             }
         }
@@ -84,7 +84,7 @@ struct ConnectionsView: View {
         } catch { if !Task.isCancelled { failure = error.localizedDescription } }
     }
     @MainActor private func close(all: Bool) async {
-        guard !closing else { return }; closing = true
+        guard model.canSwitch, !closing else { return }; closing = true
         defer { closing = false }
         do {
             let body: [String: Any] = all ? ["all": true] : ["id": selected ?? ""]

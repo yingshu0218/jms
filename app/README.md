@@ -2,7 +2,11 @@
 
 Mac 的本轮支持范围是 **SwiftUI 原生界面 + 共享 Node/sing-box**，构建与运行见 [macos/README.md](macos/README.md)。网页控制台、Tauri / WebKit 是历史备用路径，尚未接入本轮新增的每实例 Bearer 认证，不作为可用或已验证的入口。
 
-**当前不是正式网络接管成品。** 普通用户系统代理授权尚未接入，原生TUN提权衔接也未验收；CI产物为隔离Candidate，不可据构建/回环测试成功接管正在使用的网络。
+**当前不是正式网络接管成品。**
+
+交互式系统代理的私管道/WAL原型见 [分阶段设计](docs/native-proxy-authorization.md)；默认授权器仍Unavailable，pending恢复日志会进入可见受限状态，不等于已恢复网络。
+
+ 普通用户系统代理授权尚未接入，原生TUN提权衔接也未验收；CI产物为隔离Candidate，不可据构建/回环测试成功接管正在使用的网络。
 
 ```bash
 npm test                              # 安全隔离单测，无真实网络接管
