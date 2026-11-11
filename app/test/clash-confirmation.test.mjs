@@ -23,13 +23,17 @@ test('Clash mode confirmation waits for old value to become requested value, PAT
   assert.equal(calls.filter(c=>c.method==='GET').length,2);
 });
 test('Clash mode confirmation rejects a permanently old value instead of treating 204 as success', async () => {
-  const {api,calls}=fixture(()=>modeResponse('rule'),{confirmationTimeoutMs:35});
+  let tick=0;
+  const {api,calls}=fixture(()=>modeResponse('rule'),{confirmationTimeoutMs:35,now:()=>tick++});
   await assert.rejects(api.setMode('global'),{code:'CLASH_UNCONFIRMED'});
   assert.equal(calls.filter(c=>c.method==='PATCH').length,1);
 });
+// Freeze logical time until the requested stage is entered. The real request
+// timeout still bounds an abort-ignoring transport; host scheduling cannot use
+// the tiny fixture budget before GET/text was actually exercised.
 test('Clash total confirmation deadline bounds an abort-ignoring GET', async () => {
   for (const bodyOnly of [false,true]) {
-    const {api,calls}=fixture(()=>bodyOnly ? {ok:true,text:()=>new Promise(()=>{})} : new Promise(()=>{}),{confirmationTimeoutMs:35});
+    const {api,calls}=fixture(()=>bodyOnly ? {ok:true,text:()=>new Promise(()=>{})} : new Promise(()=>{}),{confirmationTimeoutMs:35,now:()=>0});
     await assert.rejects(api.setMode('global'),{code:'CLASH_UNCONFIRMED'});
     assert.equal(calls.filter(c=>c.method==='GET').length,1);
   }
@@ -51,7 +55,7 @@ test('Clash target response or body returned after total deadline cannot become 
     let release;
     const {api,calls}=fixture(()=>bodyOnly
       ? {ok:true,text:()=>new Promise(resolve=>release=()=>resolve(JSON.stringify({mode:'global','mode-list':['rule','global','direct']})))}
-      : new Promise(resolve=>release=()=>resolve(modeResponse('global'))),{confirmationTimeoutMs:35});
+      : new Promise(resolve=>release=()=>resolve(modeResponse('global'))),{confirmationTimeoutMs:35,now:()=>0});
     await assert.rejects(api.setMode('global'),{code:'CLASH_UNCONFIRMED'});
     release();await new Promise(resolve=>setImmediate(resolve));
     assert.deepEqual(calls.map(c=>c.method),['PATCH','GET']);
@@ -59,7 +63,8 @@ test('Clash target response or body returned after total deadline cannot become 
 });
 test('Clash selector confirmation waits for exact now tag and rejects a mismatched tag', async () => {
   for(const succeeds of [true,false]) {
-    const {api,calls}=fixture(read=>new Response(JSON.stringify({proxies:{proxy:{now:succeeds&&read>1?'B':'A'}}})),{confirmationTimeoutMs:succeeds?2000:35});
+    let tick=0;
+    const {api,calls}=fixture(read=>new Response(JSON.stringify({proxies:{proxy:{now:succeeds&&read>1?'B':'A'}}})),{confirmationTimeoutMs:succeeds?2000:35,now:()=>tick++});
     if(succeeds) assert.equal(await api.select('proxy','B'),true);
     else await assert.rejects(api.select('proxy','B'),{code:'CLASH_UNCONFIRMED'});
     assert.equal(calls.filter(c=>c.method==='PUT').length,1);
@@ -69,7 +74,7 @@ test('Clash selector confirmation waits for exact now tag and rejects a mismatch
 test('Clash PATCH consumes the same total budget as readback', async () => {
   let release;
   const calls=[];
-  const api=new ClashApi('http://127.0.0.1:1',{confirmationTimeoutMs:35,fetchImpl:(url,request)=>{
+  const api=new ClashApi('http://127.0.0.1:1',{confirmationTimeoutMs:35,now:()=>0,fetchImpl:(url,request)=>{
     calls.push(request.method||'GET');
     return new Promise(resolve=>release=()=>resolve(new Response(null,{status:204})));
   }});
@@ -93,4 +98,15 @@ test('Clash stops confirmation requests as soon as the owned PID/session guard f
     await new Promise(resolve=>setImmediate(resolve));
     assert.deepEqual(calls.map(c=>c.method),['PATCH','GET']);
   }
+});
+
+// Reproduce the heavily scheduled CI path explicitly: zero GET is the correct
+// fail-closed result when PATCH has consumed the total monotonic deadline.
+test('Clash deadline exhausted after PATCH refuses success before any GET', async () => {
+  let now=0;const calls=[];
+  const api=new ClashApi('http://127.0.0.1:1',{confirmationTimeoutMs:35,now:()=>now,fetchImpl:async(_url,request)=>{
+    calls.push(request.method||'GET');now=36;return new Response(null,{status:204});
+  }});
+  await assert.rejects(api.setMode('global'),{code:'CLASH_UNCONFIRMED'});
+  assert.deepEqual(calls,['PATCH']);
 });

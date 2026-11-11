@@ -11,12 +11,13 @@ const unconfirmed = cause => Object.assign(new Error('内核未在截止时间�
 export class ClashApi {
   constructor(baseUrl = 'http://127.0.0.1:9090', { secret = '', timeoutMs = 8000,
     confirmationTimeoutMs = Math.min(5000, timeoutMs), confirmationIntervalMs = 50,
-    fetchImpl = fetch, assertCurrent = () => {} } = {}) {
+    fetchImpl = fetch, assertCurrent = () => {}, now = () => performance.now() } = {}) {
     this.base = baseUrl.replace(/\/+$/, '');
     this.secret = secret;
     this.timeoutMs = timeoutMs;
     if (!Number.isFinite(confirmationTimeoutMs) || confirmationTimeoutMs <= 0 || !Number.isFinite(confirmationIntervalMs) || confirmationIntervalMs < 0) throw new Error('内核确认截止参数无效');
-    Object.assign(this, { confirmationTimeoutMs, confirmationIntervalMs, fetchImpl, assertCurrent });
+    if (typeof now !== 'function') throw new Error('内核确认时钟无效');
+    Object.assign(this, { confirmationTimeoutMs, confirmationIntervalMs, fetchImpl, assertCurrent, now });
   }
 
   #headers() {
@@ -25,7 +26,7 @@ export class ClashApi {
 
   async #req(path, { method = 'GET', body, timeoutMs = this.timeoutMs } = {}) {
     const ac = new AbortController();
-    const deadline = performance.now() + timeoutMs;
+    const deadline = this.now() + timeoutMs;
     const timeout = new Error('内核 API 超时');
     let timer;
     const expired = new Promise((_, reject) => { timer = setTimeout(() => { ac.abort(timeout); reject(timeout); }, timeoutMs); });
@@ -34,7 +35,7 @@ export class ClashApi {
         // Repeated confirmation requests must not disclose an old capability to a
         // replacement listener after this exact owned PID/session has exited.
         this.assertCurrent();
-        if (performance.now() >= deadline) throw timeout;
+        if (this.now() >= deadline) throw timeout;
         const res = await this.fetchImpl(`${this.base}${path}`, {
           method,
           redirect: 'error',
@@ -45,11 +46,11 @@ export class ClashApi {
           body: body ? JSON.stringify(body) : undefined,
           signal: ac.signal,
         });
-        if (ac.signal.aborted || performance.now() >= deadline) { try { Promise.resolve(res.body?.cancel()).catch(() => {}); } catch {} throw timeout; }
+        if (ac.signal.aborted || this.now() >= deadline) { try { Promise.resolve(res.body?.cancel()).catch(() => {}); } catch {} throw timeout; }
         if (!res.ok) throw new Error(`内核 API ${method} ${path} → HTTP ${res.status}`);
         // PUT 切换节点可能返回空体
         const text = await res.text();
-        if (ac.signal.aborted || performance.now() >= deadline) throw timeout;
+        if (ac.signal.aborted || this.now() >= deadline) throw timeout;
         this.assertCurrent();
         return text ? JSON.parse(text) : null;
       })(), expired]);
@@ -60,16 +61,16 @@ export class ClashApi {
 
   async #confirm(deadline, read, matches) {
     for (;;) {
-      const remaining = deadline - performance.now();
+      const remaining = deadline - this.now();
       if (remaining <= 0) throw unconfirmed();
       this.assertCurrent();
       const value = await read(remaining);
       this.assertCurrent();
-      if (performance.now() >= deadline) throw unconfirmed();
+      if (this.now() >= deadline) throw unconfirmed();
       const confirmed = matches(value);
-      if (performance.now() >= deadline) throw unconfirmed();
+      if (this.now() >= deadline) throw unconfirmed();
       if (confirmed) return;
-      await new Promise(resolve => setTimeout(resolve, Math.min(this.confirmationIntervalMs, deadline - performance.now())));
+      await new Promise(resolve => setTimeout(resolve, Math.min(this.confirmationIntervalMs, deadline - this.now())));
     }
   }
   #confirmationError(error) {
@@ -116,12 +117,12 @@ export class ClashApi {
    * 这是把节点做成 selector 出站带来的直接好处。
    */
   async select(selectorName, targetName) {
-    const deadline = performance.now() + this.confirmationTimeoutMs;
+    const deadline = this.now() + this.confirmationTimeoutMs;
     try {
       await this.#req(`/proxies/${encodeURIComponent(selectorName)}`, {
         method: 'PUT',
         body: { name: targetName },
-        timeoutMs: Math.max(1, deadline - performance.now()),
+        timeoutMs: Math.max(1, deadline - this.now()),
       });
       await this.#confirm(deadline, remaining => this.#req('/proxies', { timeoutMs: remaining }), data => {
         const actual = data?.proxies?.[selectorName]?.now;
@@ -152,10 +153,10 @@ export class ClashApi {
    * 实际出站选择都会随之改变（配合配置里的 clash_mode 规则）。
    */
   async setMode(mode) {
-    const target = canonicalMode(mode), deadline = performance.now() + this.confirmationTimeoutMs;
+    const target = canonicalMode(mode), deadline = this.now() + this.confirmationTimeoutMs;
     if (!target) throw unconfirmed();
     try {
-      await this.#req('/configs', { method: 'PATCH', body: { mode: target }, timeoutMs: Math.max(1, deadline - performance.now()) });
+      await this.#req('/configs', { method: 'PATCH', body: { mode: target }, timeoutMs: Math.max(1, deadline - this.now()) });
       await this.#confirm(deadline, remaining => this.#req('/configs', { timeoutMs: remaining }), data => {
         const actual = canonicalMode(data?.mode), modes = data?.['mode-list'];
         if (!actual || !Array.isArray(modes) || !modes.every(value => canonicalMode(value))) throw unconfirmed();
